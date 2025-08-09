@@ -629,7 +629,7 @@ def _scan_chunk(ctx: CallbackContext, push_to=None):
         last_signal_time[pid] = now
         signals.append({"time": now, **sig})
         ctx.bot.send_message(chat_id=chat_id, text=format_signal_msg(sig), parse_mode=ParseMode.HTML)
-        # Paper: only auto-open on LONG (keep behavior), but you can add SHORT execution if you want to simulate shorts
+        # Paper: only auto-open on LONG; shorts are signaled but not auto-traded (can add if you want)
         if sig["side"] == "LONG":
             _execute_long_trade(sig, ctx, chat_id)
         hits += 1; time.sleep(0.1)
