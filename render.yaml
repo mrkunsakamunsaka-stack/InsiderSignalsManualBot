@@ -11,53 +11,35 @@ services:
       - key: TELEGRAM_MANUAL_TOKEN
         value: "8411524534:AAHppQZKZBNpSTvvX81s9RAUdlVTCTvaiVc"
 
-      # --- Label / TZ / report ---
+      # --- Money-First profile ---
       - key: MODE
         value: STRICT
-      - key: TIMEZONE
-        value: Europe/Dublin
-      - key: DAILY_REPORT_HOUR
-        value: "20"
-
-      # --- Pro cadence ---
-      - key: SCAN_INTERVAL_SECONDS
-        value: "20"
-      - key: SYMBOLS_PER_SCAN
-        value: "40"
-      - key: SIGNAL_COOLDOWN_MINUTES
-        value: "12"
-      - key: MAX_PAIRS
-        value: "0"
-
-      # --- Score gate ---
       - key: SCORE_MIN
-        value: "96"
+        value: "97"
 
-      # --- Strategy knobs (STRICT defaults) ---
-      - key: BREAKOUT_LOOKBACK
-        value: "6"
-      - key: VOLUME_MULTIPLIER
-        value: "1.30"
-      - key: RSI_MIN
-        value: "35"
-      - key: RSI_MAX
-        value: "65"
-      - key: USE_EMA_CROSS
-        value: "1"
-      - key: EMA_TOL_PCT
-        value: "0.008"
-
-      # --- Filters ---
-      - key: USE_ADX_FILTER
-        value: "1"
-      - key: ADX_MIN
-        value: "18"
+      # Trend & momentum filters
       - key: USE_HTF_FILTER
         value: "1"
       - key: USE_BTC_BIAS
         value: "1"
+      - key: USE_ADX_FILTER
+        value: "1"
+      - key: ADX_MIN
+        value: "22"
+      - key: BREAKOUT_LOOKBACK
+        value: "6"
+      - key: VOLUME_MULTIPLIER
+        value: "1.35"
+      - key: RSI_MIN
+        value: "40"
+      - key: RSI_MAX
+        value: "60"
+      - key: USE_EMA_CROSS
+        value: "1"
+      - key: EMA_TOL_PCT
+        value: "0.005"
 
-      # --- Extra guards ---
+      # Guards
       - key: MIN_PRICE
         value: "0.01"
       - key: MIN_ATR_PCT
@@ -65,31 +47,49 @@ services:
       - key: MAX_ATR_PCT
         value: "2.5"
 
-      # --- Risk / exits ---
+      # Universe & cadence
+      - key: USE_WHITELIST
+        value: "1"
+      - key: MAX_PAIRS
+        value: "20"
+      - key: SYMBOLS_PER_SCAN
+        value: "10"
+      - key: SCAN_INTERVAL_SECONDS
+        value: "60"
+      - key: SIGNAL_COOLDOWN_MINUTES
+        value: "20"
+
+      # Risk & exits
       - key: R_TP1
-        value: "1.3"
+        value: "1.2"
       - key: R_TP2
-        value: "3.0"
+        value: "2.5"
       - key: R_SL
-        value: "1.0"
+        value: "1.2"
       - key: TRAIL_AFTER_TP1
         value: "1"
 
-      # --- Paper sizing defaults (can change via chat) ---
+      # Paper sizing — your request
       - key: POSITION_PCT
-        value: "0.07"
+        value: "0.05"
       - key: MAX_OPEN_TRADES
-        value: "6"
+        value: "10"
       - key: PAPER_START_CASH
         value: "200"
 
-      # --- Keep-alive ---
+      # Timezone & daily report
+      - key: TIMEZONE
+        value: Europe/Dublin
+      - key: DAILY_REPORT_HOUR
+        value: "20"
+
+      # Keep-alive
       - key: KEEPALIVE_URL
-        value: "https://insidersignalsmanual-keen.onrender.com"
+        value: "https://YOUR-SERVICE-NAME.onrender.com"
       - key: KEEPALIVE_SECONDS
         value: "240"
 
-      # --- Robust retries / jitter ---
+      # Retries / jitter
       - key: RETRY_MAX
         value: "4"
       - key: RETRY_BASE_DELAY
