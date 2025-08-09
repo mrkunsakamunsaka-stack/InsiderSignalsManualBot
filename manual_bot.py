@@ -1,13 +1,7 @@
 # manual_bot.py — Coinbase • PAPER trading with real-time PnL + alerts + gap-safe exits
-# 2025-08-09
-# Features:
-# - PAPER starts with $200 (env PAPER_START_CASH), persists to paper.json (no auto reset)
-# - Real-time exits using ticker; gap-safe: TP2 closes whole position in one event
-# - TP1 partial (50%), trail SL to breakeven after TP1 (if TRAIL_AFTER_TP1=1)
-# - Alerts for TP1 / TP2 / SL + /alertson /alertsoff (persists to config.json)
-# - Score filter, relaxed/strict modes, daily report, live /positions PnL
+# 2025-08-09 (fix: RSI calc, re-enable SHORT signals, enforce SCORE_MIN, scheduler max_instances=2)
 
-import os, time, math, random, logging, threading, http.server, socketserver, json, hmac, hashlib, base64, uuid
+import os, time, math, random, logging, threading, http.server, socketserver, json
 from datetime import datetime, timedelta, time as dtime
 import pytz, requests, numpy as np
 from telegram import Update, ParseMode
@@ -69,16 +63,14 @@ RETRY_BASE_DELAY = float(os.getenv("RETRY_BASE_DELAY", "0.6"))
 REQ_JITTER_MIN_MS = int(os.getenv("REQ_JITTER_MIN_MS", "50"))
 REQ_JITTER_MAX_MS = int(os.getenv("REQ_JITTER_MAX_MS", "140"))
 
-# trading mode (PAPER; LIVE paths kept stubbed for future)
+# trading mode
 TRADE_MODE = os.getenv("TRADE_MODE", "PAPER").upper()
-COINBASE_API_KEY = os.getenv("COINBASE_API_KEY", "").strip()
-COINBASE_API_SECRET = os.getenv("COINBASE_API_SECRET", "").strip()  # base64
 
 # sizing/limits
 ENV_POSITION_PCT    = float(os.getenv("POSITION_PCT", "0.05"))  # 5% of cash
 ENV_MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", "10"))
 MIN_USD_PER_TRADE   = float(os.getenv("MIN_USD_PER_TRADE", "10"))
-FEE_RATE            = float(os.getenv("FEE_RATE", "0.001"))     # 0.10% each side
+FEE_RATE            = float(os.getenv("FEE_RATE", "0.001"))     # 0.10% per side
 
 # paper account
 PAPER_START_CASH = float(os.getenv("PAPER_START_CASH", "200"))
@@ -93,11 +85,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(mes
 
 # ----------------------------- Coinbase API ----------------------------------
 CB_BASE = "https://api.exchange.coinbase.com"
-CB_AT   = "https://api.coinbase.com"
 GRAN_5M, GRAN_15M, GRAN_1H, GRAN_4H = 300, 900, 3600, 4*3600
 
 session = requests.Session()
-session.headers.update({"User-Agent": "insider-paper-rt/1.4"})
+session.headers.update({"User-Agent": "insider-paper-rt/1.5"})
 
 # ------------------------------- state ---------------------------------------
 signals = []
@@ -107,7 +98,6 @@ scan_cursor = 0
 last_chat_id = None
 BTC_STATE = {"bias": 0, "ts": 0}
 NO_4H = set()
-OPEN_TRADES = {}
 
 CONFIG_PATH = "config.json"
 CONFIG = {
@@ -193,7 +183,8 @@ def rsi(arr, period=14):
     if len(arr) <= period: return None
     diff = np.diff(arr)
     gain = np.where(diff > 0, diff, 0.0)
-    loss = np.where(diff < 0, 0.0, -diff)
+    # FIX: correct loss calculation (was flipped)
+    loss = np.where(diff < 0, -diff, 0.0)
     ag = [np.mean(gain[:period])]; al = [np.mean(loss[:period])]
     for i in range(period, len(diff)):
         ag.append((ag[-1]*(period-1) + gain[i]) / period)
@@ -354,6 +345,7 @@ def intraday_signal(pid):
     o15,h15,l15,c15,v15 = cb_candles(pid, GRAN_15M, 200)
     o1,h1,l1,c1,v1      = cb_candles(pid, GRAN_1H, 200)
 
+    # HTF only when enabled and available
     c4h = None
     if globals().get("USE_HTF_FILTER", False) and pid not in NO_4H:
         o4h,h4h,l4h,c4h,v4h = cb_candles(pid, GRAN_4H, 200)
@@ -390,28 +382,41 @@ def intraday_signal(pid):
 
     EMA_TOL_PCT = globals().get("EMA_TOL_PCT", 0.012)
     trend_up = (last_close > ema50_now) or near_trend_ok(last_close, ema50_now, EMA_TOL_PCT)
-    # strict would require HTF uptrend; relaxed tolerates neutral HTF
-    htf_up = True
+    trend_dn = (last_close < ema50_now) or near_trend_ok(last_close, ema50_now, EMA_TOL_PCT)
+
+    # HTF filter — both directions
+    htf_up = True; htf_dn = True
     if globals().get("USE_HTF_FILTER", False) and ema200_4h is not None:
         HTF_TOL_PCT = globals().get("HTF_TOL_PCT", 0.005)
         htf_up = (c1[-1] >= (1-HTF_TOL_PCT)*ema200_1h[-1]) and (c4h[-1] >= (1-HTF_TOL_PCT)*ema200_4h[-1])
+        htf_dn = (c1[-1] <= (1+HTF_TOL_PCT)*ema200_1h[-1]) and (c4h[-1] <= (1+HTF_TOL_PCT)*ema200_4h[-1])
 
     vol_ok = last_vol >= globals().get("VOLUME_MULTIPLIER",1.05) * max(vol_avg, 1e-9)
+
+    # BTC bias can veto
     if globals().get("USE_BTC_BIAS", False):
-        if BTC_STATE["bias"] == -1 and long_trigger:  return None
+        if BTC_STATE["bias"] == -1 and long_trigger:  long_trigger = False
+        if BTC_STATE["bias"] == +1 and short_trigger: short_trigger = False
 
     a5_arr = atr(h5, l5, c5, 14)
     if a5_arr is None or math.isnan(a5_arr[-1]): return None
     a5 = float(a5_arr[-1])
 
-    long_ok  = long_trigger and vol_ok and r_ok and trend_up and htf_up and adx_ok
-    if not long_ok: return None
+    long_ok  = long_trigger  and vol_ok and r_ok and trend_up and htf_up and adx_ok
+    short_ok = short_trigger and vol_ok and r_ok and trend_dn and htf_dn and adx_ok
+    if not (long_ok or short_ok): return None
 
-    sl, tp1, tp2 = r_targets(last_close, a5, "LONG", r1=R_TP1, r2=R_TP2, sl_mult=R_SL)
-    return {"symbol": pid, "side": "LONG", "entry": round(last_close,6),
-            "tp1": round(tp1,6), "tp2": round(tp2,6), "sl": round(sl,6),
-            "atr": round(a5,6),
-            "score": score_signal("LONG", last_close, ema50_now, a5, vol_ok, r[-1], adx1h[-1] if adx1h is not None else None)}
+    side = "LONG" if long_ok else "SHORT"
+    sl, tp1, tp2 = r_targets(last_close, a5, side, r1=R_TP1, r2=R_TP2, sl_mult=R_SL)
+
+    return {
+        "symbol": pid, "side": side,
+        "entry": round(last_close,6),
+        "tp1": round(tp1,6), "tp2": round(tp2,6),
+        "sl": round(sl,6),
+        "atr": round(a5,6),
+        "score": score_signal(side, last_close, ema50_now, a5, vol_ok, r[-1], adx1h[-1] if adx1h is not None else None)
+    }
 
 # ----------------------------- telegram helpers ------------------------------
 def target_chat_id(update: Update = None):
@@ -624,7 +629,9 @@ def _scan_chunk(ctx: CallbackContext, push_to=None):
         last_signal_time[pid] = now
         signals.append({"time": now, **sig})
         ctx.bot.send_message(chat_id=chat_id, text=format_signal_msg(sig), parse_mode=ParseMode.HTML)
-        _execute_long_trade(sig, ctx, chat_id)
+        # Paper: only auto-open on LONG (keep behavior), but you can add SHORT execution if you want to simulate shorts
+        if sig["side"] == "LONG":
+            _execute_long_trade(sig, ctx, chat_id)
         hits += 1; time.sleep(0.1)
     if hits == 0 and push_to:
         ctx.bot.send_message(chat_id=push_to, text=f"(No valid setups ≥ {CONFIG['SCORE_MIN']} this minute — still watching.)")
@@ -663,7 +670,7 @@ def _paper_check_exits(ctx: CallbackContext):
 
         # ----- TP1 partial (only once), then trail SL to BE -----
         if (not p["tp1_done"]) and cur >= p["tp1"]:
-            exit_value = p["tp1"] * p["qty_tp1"]   # deterministic fill at TP1
+            exit_value = p["tp1"] * p["qty_tp1"]
             fee_close = exit_value * FEE_RATE
             PAPER["cash"] += (exit_value - fee_close)
             PAPER["fees_paid"] += fee_close
@@ -758,8 +765,12 @@ def main():
     dp.add_handler(CommandHandler("scan", cmd_scan))
 
     jq: JobQueue = updater.job_queue
-    jq.run_repeating(lambda c: _scan_chunk(c), interval=SCAN_INTERVAL_SECONDS, first=random.randint(6, 12))
-    jq.run_repeating(job_paper_watch, interval=PAPER_CHECK_SECONDS, first=8)  # real-time exits + alerts
+    jq.run_repeating(lambda c: _scan_chunk(c),
+                     interval=SCAN_INTERVAL_SECONDS,
+                     first=random.randint(6, 12),
+                     name="job_scan",
+                     max_instances=2)  # allow one overlap to reduce skipped runs
+    jq.run_repeating(job_paper_watch, interval=PAPER_CHECK_SECONDS, first=8)
     jq.run_daily(job_daily, time=dtime(hour=DAILY_REPORT_HOUR, minute=0, tzinfo=tz))
     if KEEPALIVE_URL: jq.run_repeating(job_keepalive, interval=KEEPALIVE_SECONDS, first=5)
 
