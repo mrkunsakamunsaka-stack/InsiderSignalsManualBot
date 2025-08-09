@@ -1,5 +1,5 @@
-# manual_bot.py — Coinbase • PAPER trading with real-time PnL + alerts + gap-safe exits
-# 2025-08-09 (fix: RSI calc, re-enable SHORT signals, enforce SCORE_MIN, scheduler max_instances=2)
+# manual_bot.py — Coinbase • PAPER trading with real-time PnL + alerts
+# Compatible with python-telegram-bot==13.15 (no max_instances usage)
 
 import os, time, math, random, logging, threading, http.server, socketserver, json
 from datetime import datetime, timedelta, time as dtime
@@ -63,22 +63,19 @@ RETRY_BASE_DELAY = float(os.getenv("RETRY_BASE_DELAY", "0.6"))
 REQ_JITTER_MIN_MS = int(os.getenv("REQ_JITTER_MIN_MS", "50"))
 REQ_JITTER_MAX_MS = int(os.getenv("REQ_JITTER_MAX_MS", "140"))
 
-# trading mode
-TRADE_MODE = os.getenv("TRADE_MODE", "PAPER").upper()
-
-# sizing/limits
-ENV_POSITION_PCT    = float(os.getenv("POSITION_PCT", "0.05"))  # 5% of cash
-ENV_MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", "10"))
-MIN_USD_PER_TRADE   = float(os.getenv("MIN_USD_PER_TRADE", "10"))
-FEE_RATE            = float(os.getenv("FEE_RATE", "0.001"))     # 0.10% per side
-
 # paper account
 PAPER_START_CASH = float(os.getenv("PAPER_START_CASH", "200"))
 PAPER_PATH = "paper.json"
 PAPER_CHECK_SECONDS = int(os.getenv("PAPER_CHECK_SECONDS", "15"))
 
-# alerts default (overridden by persisted config later)
-ALERTS = os.getenv("ALERTS", "1") == "1"
+# sizing/limits
+ENV_POSITION_PCT    = float(os.getenv("POSITION_PCT", "0.05"))  # 5% of cash
+ENV_MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", "10"))
+MIN_USD_PER_TRADE   = float(os.getenv("MIN_USD_PER_TRADE", "10"))
+FEE_RATE            = float(os.getenv("FEE_RATE", "0.001"))     # 0.10% each side
+
+# alerts default (persisted in config.json)
+ALERTS_DEFAULT = os.getenv("ALERTS", "1") == "1"
 
 tz = pytz.timezone(TIMEZONE)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
@@ -88,7 +85,7 @@ CB_BASE = "https://api.exchange.coinbase.com"
 GRAN_5M, GRAN_15M, GRAN_1H, GRAN_4H = 300, 900, 3600, 4*3600
 
 session = requests.Session()
-session.headers.update({"User-Agent": "insider-paper-rt/1.5"})
+session.headers.update({"User-Agent": "insider-paper-rt/ptb13"})
 
 # ------------------------------- state ---------------------------------------
 signals = []
@@ -105,7 +102,7 @@ CONFIG = {
     "SCORE_MIN": ENV_SCORE_MIN,
     "POSITION_PCT": ENV_POSITION_PCT,
     "MAX_OPEN_TRADES": ENV_MAX_OPEN_TRADES,
-    # ALERTS persisted below after load
+    "ALERTS": 1 if ALERTS_DEFAULT else 0,
 }
 
 PAPER = {
@@ -120,7 +117,6 @@ PAPER = {
     "losses": 0
 }
 
-# ------------------------- persistence helpers -------------------------
 def _load_json(path, default):
     try:
         if os.path.exists(path):
@@ -139,31 +135,19 @@ def load_config():
     global CONFIG
     CONFIG.update(_load_json(CONFIG_PATH, CONFIG))
 
-def save_config():
-    _save_json(CONFIG_PATH, CONFIG)
+def save_config(): _save_json(CONFIG_PATH, CONFIG)
 
 def load_paper():
     global PAPER
     data = _load_json(PAPER_PATH, None)
     if data: PAPER.update(data)
-    else:
-        PAPER.update({"cash": PAPER_START_CASH, "equity": PAPER_START_CASH,
-                      "positions": {}, "closed": [], "seq": 1,
-                      "realized_pnl": 0.0, "fees_paid": 0.0, "wins": 0, "losses": 0})
+    else: save_paper()
 
-def save_paper():
-    _save_json(PAPER_PATH, PAPER)
+def save_paper(): _save_json(PAPER_PATH, PAPER)
 
 load_config(); load_paper()
-# persist/read alerts in CONFIG
-try:
-    CONFIG["ALERTS"] = int(CONFIG.get("ALERTS", 1 if ALERTS else 0))
-    ALERTS = bool(CONFIG["ALERTS"])
-except Exception:
-    CONFIG["ALERTS"] = 1 if ALERTS else 0
-    ALERTS = bool(CONFIG["ALERTS"])
+ALERTS = bool(CONFIG.get("ALERTS", 1))
 
-# --- mode mapping
 def apply_mode(mode: str):
     mode = (mode or "RELAXED").upper()
     params = RELAXED_DEFAULTS if mode == "RELAXED" else STRICT_DEFAULTS
@@ -183,7 +167,6 @@ def rsi(arr, period=14):
     if len(arr) <= period: return None
     diff = np.diff(arr)
     gain = np.where(diff > 0, diff, 0.0)
-    # FIX: correct loss calculation (was flipped)
     loss = np.where(diff < 0, -diff, 0.0)
     ag = [np.mean(gain[:period])]; al = [np.mean(loss[:period])]
     for i in range(period, len(diff)):
@@ -235,7 +218,7 @@ def _get_with_retry(url, params=None, timeout=15):
             r = session.get(url, params=params, timeout=timeout)
             if r.status_code in (429, 502, 503, 504): raise RequestException(f"HTTP {r.status_code}")
             r.raise_for_status(); return r
-        except (RequestException, RemoteDisconnected) as e:
+        except (RequestException, RemoteDisconnected):
             if attempt == RETRY_MAX - 1: raise
             time.sleep(delay * (1.6 ** attempt) + random.uniform(0.05, 0.25))
     raise RequestException("unreachable")
@@ -303,14 +286,6 @@ def illiquid(o5,h5,l5,c5):
     rng = (max(h5[-20:]) - min(l5[-20:])) / max(1e-9, c5[-1])
     return rng < 0.0005
 
-def ema_arr(arr, p): 
-    if arr is None: return None
-    return ema(arr, p)
-
-def adx_arr(h,l,c, p=14):
-    if c is None: return None
-    return adx(h,l,c,p)
-
 def update_btc_bias():
     if not globals().get("USE_BTC_BIAS", False):
         BTC_STATE.update({"bias": 0, "ts": time.time()}); return
@@ -319,7 +294,7 @@ def update_btc_bias():
     o5,h5,l5,c5,v5 = cb_candles("BTC-USD", GRAN_5M, 120)
     o1,h1,l1,c1,v1 = cb_candles("BTC-USD", GRAN_1H, 200)
     if not c5 or not c1: BTC_STATE.update({"bias": 0, "ts": now}); return
-    ema50_1h = ema_arr(c1, 50); r5 = rsi(c5, 14)
+    ema50_1h = ema(c1, 50); r5 = rsi(c5, 14)
     bias = 0
     if ema50_1h is not None and r5 is not None and not math.isnan(r5[-1]):
         if c1[-1] < ema50_1h[-1] and r5[-1] < 35: bias = -1
@@ -345,19 +320,18 @@ def intraday_signal(pid):
     o15,h15,l15,c15,v15 = cb_candles(pid, GRAN_15M, 200)
     o1,h1,l1,c1,v1      = cb_candles(pid, GRAN_1H, 200)
 
-    # HTF only when enabled and available
     c4h = None
     if globals().get("USE_HTF_FILTER", False) and pid not in NO_4H:
         o4h,h4h,l4h,c4h,v4h = cb_candles(pid, GRAN_4H, 200)
         if not c4h: NO_4H.add(pid)
 
-    ema50_1h  = ema_arr(c1, 50)
-    ema200_1h = ema_arr(c1, 200)
+    ema50_1h  = ema(c1, 50)
+    ema200_1h = ema(c1, 200)
     if ema50_1h is None or ema200_1h is None: return None
     ema50_now = ema50_1h[-1]
-    ema200_4h = ema_arr(c4h, 200) if c4h else None
+    ema200_4h = ema(c4h, 200) if c4h else None
 
-    adx1h = adx_arr(h1, l1, c1, 14) if c1 else None
+    adx1h = adx(h1, l1, c1, 14) if c1 else None
     adx_ok = True
     if globals().get("USE_ADX_FILTER", True):
         adx_ok = (adx1h is not None and not math.isnan(adx1h[-1]) and adx1h[-1] >= globals().get("ADX_MIN", 10))
@@ -371,52 +345,36 @@ def intraday_signal(pid):
     if r is None or math.isnan(r[-1]): return None
     r_ok = (globals().get("RSI_MIN",20) <= r[-1] <= globals().get("RSI_MAX",80))
 
-    ema20_5 = ema_arr(c5, 20)
+    ema20_5 = ema(c5, 20)
     use_ema_cross = globals().get("USE_EMA_CROSS", True)
     cross_up = ema20_5 is not None and c5[-1] > ema20_5[-1] and c5[-2] <= ema20_5[-2]
-    cross_dn = ema20_5 is not None and c5[-1] < ema20_5[-1] and c5[-2] >= ema20_5[-2]
-    brk_up = last_close > hh; brk_dn = last_close < ll
+    brk_up = last_close > hh
 
     long_trigger  = brk_up or (use_ema_cross and cross_up)
-    short_trigger = brk_dn or (use_ema_cross and cross_dn)
-
     EMA_TOL_PCT = globals().get("EMA_TOL_PCT", 0.012)
     trend_up = (last_close > ema50_now) or near_trend_ok(last_close, ema50_now, EMA_TOL_PCT)
-    trend_dn = (last_close < ema50_now) or near_trend_ok(last_close, ema50_now, EMA_TOL_PCT)
 
-    # HTF filter — both directions
-    htf_up = True; htf_dn = True
+    htf_up = True
     if globals().get("USE_HTF_FILTER", False) and ema200_4h is not None:
         HTF_TOL_PCT = globals().get("HTF_TOL_PCT", 0.005)
         htf_up = (c1[-1] >= (1-HTF_TOL_PCT)*ema200_1h[-1]) and (c4h[-1] >= (1-HTF_TOL_PCT)*ema200_4h[-1])
-        htf_dn = (c1[-1] <= (1+HTF_TOL_PCT)*ema200_1h[-1]) and (c4h[-1] <= (1+HTF_TOL_PCT)*ema200_4h[-1])
 
     vol_ok = last_vol >= globals().get("VOLUME_MULTIPLIER",1.05) * max(vol_avg, 1e-9)
-
-    # BTC bias can veto
     if globals().get("USE_BTC_BIAS", False):
-        if BTC_STATE["bias"] == -1 and long_trigger:  long_trigger = False
-        if BTC_STATE["bias"] == +1 and short_trigger: short_trigger = False
+        if BTC_STATE["bias"] == -1 and long_trigger:  return None
 
     a5_arr = atr(h5, l5, c5, 14)
     if a5_arr is None or math.isnan(a5_arr[-1]): return None
     a5 = float(a5_arr[-1])
 
-    long_ok  = long_trigger  and vol_ok and r_ok and trend_up and htf_up and adx_ok
-    short_ok = short_trigger and vol_ok and r_ok and trend_dn and htf_dn and adx_ok
-    if not (long_ok or short_ok): return None
+    long_ok  = long_trigger and vol_ok and r_ok and trend_up and htf_up and adx_ok
+    if not long_ok: return None
 
-    side = "LONG" if long_ok else "SHORT"
-    sl, tp1, tp2 = r_targets(last_close, a5, side, r1=R_TP1, r2=R_TP2, sl_mult=R_SL)
-
-    return {
-        "symbol": pid, "side": side,
-        "entry": round(last_close,6),
-        "tp1": round(tp1,6), "tp2": round(tp2,6),
-        "sl": round(sl,6),
-        "atr": round(a5,6),
-        "score": score_signal(side, last_close, ema50_now, a5, vol_ok, r[-1], adx1h[-1] if adx1h is not None else None)
-    }
+    sl, tp1, tp2 = r_targets(last_close, a5, "LONG", r1=R_TP1, r2=R_TP2, sl_mult=R_SL)
+    return {"symbol": pid, "side": "LONG", "entry": round(last_close,6),
+            "tp1": round(tp1,6), "tp2": round(tp2,6), "sl": round(sl,6),
+            "atr": round(a5,6),
+            "score": score_signal("LONG", last_close, ema50_now, a5, vol_ok, r[-1], adx1h[-1] if adx1h is not None else None)}
 
 # ----------------------------- telegram helpers ------------------------------
 def target_chat_id(update: Update = None):
@@ -451,7 +409,7 @@ def cmd_start(update: Update, ctx: CallbackContext):
         "👋 InsiderSignals_Manual (Coinbase • PAPER RT)\n"
         f"Mode: <b>{CONFIG['MODE']}</b> | SCORE_MIN <b>{CONFIG['SCORE_MIN']}</b>\n"
         f"Max open: <b>{CONFIG['MAX_OPEN_TRADES']}</b> | Alloc: <b>{int(CONFIG['POSITION_PCT']*100)}%</b>\n"
-        f"TRADE_MODE: <b>{TRADE_MODE}</b> | Alerts: <b>{'ON' if ALERTS else 'OFF'}</b>\n"
+        f"Alerts: <b>{'ON' if ALERTS else 'OFF'}</b>\n"
         f"Paper cash: ${PAPER['cash']:.2f}\n\n"
         "Commands:\n"
         "/paper /positions /closed /pnl /paperreset /setpaper N\n"
@@ -568,8 +526,7 @@ def cmd_scan(update: Update, ctx: CallbackContext):
 def _can_open_more_trades():
     return len(PAPER["positions"]) < CONFIG["MAX_OPEN_TRADES"]
 
-def _free_usd_balance():
-    return float(PAPER["cash"])
+def _free_usd_balance(): return float(PAPER["cash"])
 
 def _execute_long_trade(sig, ctx: CallbackContext, chat_id):
     if not _can_open_more_trades():
@@ -578,7 +535,6 @@ def _execute_long_trade(sig, ctx: CallbackContext, chat_id):
     alloc = max(MIN_USD_PER_TRADE, free_usd * float(CONFIG["POSITION_PCT"]))
     if free_usd < MIN_USD_PER_TRADE:
         ctx.bot.send_message(chat_id=chat_id, text="⚪ Skipped: insufficient USD balance"); return
-
     entry = sig["entry"]
     qty = (alloc * (1 - FEE_RATE)) / entry
     fee_open = alloc * FEE_RATE
@@ -629,9 +585,7 @@ def _scan_chunk(ctx: CallbackContext, push_to=None):
         last_signal_time[pid] = now
         signals.append({"time": now, **sig})
         ctx.bot.send_message(chat_id=chat_id, text=format_signal_msg(sig), parse_mode=ParseMode.HTML)
-        # Paper: only auto-open on LONG; shorts are signaled but not auto-traded (can add if you want)
-        if sig["side"] == "LONG":
-            _execute_long_trade(sig, ctx, chat_id)
+        _execute_long_trade(sig, ctx, chat_id)
         hits += 1; time.sleep(0.1)
     if hits == 0 and push_to:
         ctx.bot.send_message(chat_id=push_to, text=f"(No valid setups ≥ {CONFIG['SCORE_MIN']} this minute — still watching.)")
@@ -644,7 +598,7 @@ def _paper_check_exits(ctx: CallbackContext):
         cur = cb_ticker_price(p["symbol"])
         if not np.isfinite(cur): continue
 
-        # ----- GAP-SAFE: TP2 dominates everything -----
+        # TP2 closes whole position (gap-safe)
         if cur >= p["tp2"]:
             exit_price = p["tp2"]
             proceeds = exit_price * p["qty_total"]
@@ -668,7 +622,7 @@ def _paper_check_exits(ctx: CallbackContext):
             _alert(ctx, f"🎯 <b>TP2 hit</b> {p['symbol']} @ {exit_price:.6f} | PnL ${pnl_usd:.2f} ({pnl_pct:.2f}%)")
             continue
 
-        # ----- TP1 partial (only once), then trail SL to BE -----
+        # TP1 partial once, trail to BE
         if (not p["tp1_done"]) and cur >= p["tp1"]:
             exit_value = p["tp1"] * p["qty_tp1"]
             fee_close = exit_value * FEE_RATE
@@ -679,12 +633,9 @@ def _paper_check_exits(ctx: CallbackContext):
             if TRAIL_AFTER_TP1: p["sl_dyn"] = max(p["sl_dyn"], p["entry_avg"])
             _alert(ctx, f"🥳 <b>TP1 partial</b> {p['symbol']} sold {p['qty_tp1']:.6f} @ {p['tp1']:.6f}")
 
-        # ----- Final exits on runner via SL (TP2 case handled above) -----
-        exit_reason = None; exit_price = None
+        # SL on runner
         if cur <= p["sl_dyn"]:
-            exit_reason, exit_price = "SL", p["sl_dyn"]
-
-        if exit_price is not None:
+            exit_price = p["sl_dyn"]
             runner_val = exit_price * p["qty_runner"]
             fee_close = runner_val * FEE_RATE
             PAPER["cash"] += (runner_val - fee_close)
@@ -702,10 +653,10 @@ def _paper_check_exits(ctx: CallbackContext):
                 "id": pid, "symbol": p["symbol"], "entry_avg": p["entry_avg"],
                 "exit_avg": avg_exit, "qty_total": p["qty_total"],
                 "pnl_usd": pnl_usd, "pnl_pct": pnl_pct,
-                "reason": exit_reason, "closed_at": datetime.now(tz).isoformat()
+                "reason": "SL", "closed_at": datetime.now(tz).isoformat()
             })
             to_remove.append(pid)
-            _alert(ctx, f"🛑 <b>{exit_reason}</b> {p['symbol']} avg exit {avg_exit:.6f} | PnL ${pnl_usd:.2f} ({pnl_pct:.2f}%)")
+            _alert(ctx, f"🛑 <b>SL</b> {p['symbol']} avg exit {avg_exit:.6f} | PnL ${pnl_usd:.2f} ({pnl_pct:.2f}%)")
 
     for pid in to_remove:
         PAPER["positions"].pop(pid, None)
@@ -765,16 +716,13 @@ def main():
     dp.add_handler(CommandHandler("scan", cmd_scan))
 
     jq: JobQueue = updater.job_queue
-    jq.run_repeating(lambda c: _scan_chunk(c),
-                     interval=SCAN_INTERVAL_SECONDS,
-                     first=random.randint(6, 12),
-                     name="job_scan",
-                     max_instances=2)  # allow one overlap to reduce skipped runs
+    jq.run_repeating(lambda c: _scan_chunk(c), interval=SCAN_INTERVAL_SECONDS, first=random.randint(6, 12))
     jq.run_repeating(job_paper_watch, interval=PAPER_CHECK_SECONDS, first=8)
     jq.run_daily(job_daily, time=dtime(hour=DAILY_REPORT_HOUR, minute=0, tzinfo=tz))
-    if KEEPALIVE_URL: jq.run_repeating(job_keepalive, interval=KEEPALIVE_SECONDS, first=5)
+    if KEEPALIVE_URL:
+        jq.run_repeating(job_keepalive, interval=KEEPALIVE_SECONDS, first=5)
 
-    logging.info(f"InsiderSignals_Manual started. TRADE_MODE={TRADE_MODE} PAPER_CASH=${PAPER['cash']:.2f} ALERTS={ALERTS}")
+    logging.info(f"InsiderSignals_Manual started. PAPER_CASH=${PAPER['cash']:.2f} ALERTS={ALERTS}")
     updater.start_polling()
     updater.idle()
 
