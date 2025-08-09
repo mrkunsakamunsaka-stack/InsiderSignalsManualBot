@@ -5,55 +5,59 @@ services:
     plan: free
     autoDeploy: true
     dockerfilePath: ./Dockerfile
+
     envVars:
+      # --- REQUIRED: Telegram Bot Token ---
       - key: TELEGRAM_MANUAL_TOKEN
         value: "8411524534:AAHppQZKZBNpSTvvX81s9RAUdlVTCTvaiVc"
 
+      # --- Label & score filter ---
       - key: MODE
         value: RELAXED
+      - key: SCORE_MIN
+        value: "85"        # try 80–85; 90 is very strict
 
+      # --- Timezone & daily report hour ---
       - key: TIMEZONE
         value: Europe/Dublin
       - key: DAILY_REPORT_HOUR
         value: "20"
 
-      # --- activity & coverage ---
-      - key: MIN_SCORE
-        value: "80"
+      # --- Coverage & cadence (balanced for free tier) ---
       - key: SYMBOLS_PER_SCAN
-        value: "120"
+        value: "60"
       - key: SCAN_INTERVAL_SECONDS
         value: "20"
       - key: SIGNAL_COOLDOWN_MINUTES
         value: "6"
       - key: MAX_PAIRS
-        value: "0"
+        value: "0"         # 0 = all USD/USDT Coinbase pairs
 
-      # --- looser gates ---
+      # --- Strategy gates (relaxed but sane) ---
       - key: BREAKOUT_LOOKBACK
-        value: "2"
+        value: "3"
       - key: VOLUME_MULTIPLIER
-        value: "1.00"
+        value: "1.03"
       - key: RSI_MIN
-        value: "15"
+        value: "20"
       - key: RSI_MAX
-        value: "85"
+        value: "80"
       - key: USE_EMA_CROSS
         value: "1"
       - key: EMA_TOL_PCT
-        value: "0.02"
+        value: "0.015"
 
-      # --- filters ---
+      # --- Filters ---
       - key: USE_ADX_FILTER
-        value: "0"
+        value: "1"
       - key: ADX_MIN
-        value: "10"
+        value: "8"
       - key: USE_HTF_FILTER
         value: "0"
       - key: USE_BTC_BIAS
         value: "0"
 
-      # --- targets/risk (unchanged) ---
+      # --- Risk / exits ---
       - key: R_TP1
         value: "1.1"
       - key: R_TP2
@@ -63,13 +67,29 @@ services:
       - key: TRAIL_AFTER_TP1
         value: "1"
 
-      # --- keep-alive ---
+      # --- Paper trading defaults ---
+      - key: PAPER_START_CASH
+        value: "200"
+      - key: POSITION_PCT
+        value: "0.05"      # 5% per trade
+      - key: MAX_OPEN_TRADES
+        value: "10"
+      - key: MIN_USD_PER_TRADE
+        value: "10"
+      - key: FEE_RATE
+        value: "0.001"
+      - key: PAPER_CHECK_SECONDS
+        value: "15"
+      - key: ALERTS
+        value: "1"
+
+      # --- Keep-alive (optional; fill after first deploy with your service URL) ---
       - key: KEEPALIVE_URL
-        value: "https://insidersignalsmanual-ybsp.onrender.com"
+        value: ""
       - key: KEEPALIVE_SECONDS
         value: "240"
 
-      # --- retry/jitter ---
+      # --- Robust retries / jitter ---
       - key: RETRY_MAX
         value: "4"
       - key: RETRY_BASE_DELAY
