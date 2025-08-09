@@ -1,6 +1,6 @@
 # manual_bot.py
 # InsiderSignals_Manual — Intraday signals (5m/15m/1h) for top-50 USDT pairs
-# Uses Binance public API (no key). Works on Render free (web service with keep-alive HTTP).
+# Binance public API (no key). Render free-friendly (web service with keep-alive).
 
 import os, time, math, logging, threading, http.server, socketserver
 from datetime import datetime, timedelta, time as dtime
@@ -8,7 +8,7 @@ import pytz, requests, numpy as np
 from telegram import Update, ParseMode
 from telegram.ext import Updater, CommandHandler, CallbackContext, JobQueue
 
-# ---------- keep-alive HTTP server so Render Web Service stays up ----------
+# ---------- keep-alive HTTP server (keeps Render Web Service running) ----------
 PORT = int(os.getenv("PORT", "10000"))
 class _Handler(http.server.SimpleHTTPRequestHandler):
     def do_GET(self):
@@ -17,27 +17,26 @@ def _keepalive():
     with socketserver.TCPServer(("", PORT), _Handler) as httpd:
         httpd.serve_forever()
 threading.Thread(target=_keepalive, daemon=True).start()
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
 
-# -------------------- settings (override in Render Environment) ------------
+# -------------------- settings (override in Render Environment) ----------------
 TOKEN = os.getenv("TELEGRAM_MANUAL_TOKEN")
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Dublin")
 DAILY_REPORT_HOUR = int(os.getenv("DAILY_REPORT_HOUR", "20"))
 FORCED_CHAT_ID = os.getenv("CHAT_ID")  # optional numeric id
 
 # cadence / throttles
-SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "60"))     # scan every 1 min
-SIGNAL_COOLDOWN_MIN = int(os.getenv("SIGNAL_COOLDOWN_MINUTES", "10"))     # per-symbol cooldown
-SYMBOLS_PER_SCAN = int(os.getenv("SYMBOLS_PER_SCAN", "10"))               # rotate 10 symbols per scan
+SCAN_INTERVAL_SECONDS   = int(os.getenv("SCAN_INTERVAL_SECONDS", "60"))   # 1 min
+SIGNAL_COOLDOWN_MIN     = int(os.getenv("SIGNAL_COOLDOWN_MINUTES", "10")) # per symbol
+SYMBOLS_PER_SCAN        = int(os.getenv("SYMBOLS_PER_SCAN", "10"))        # rotate 10 per scan
 
-# strategy thresholds (relaxed but sane). Tweak from Render without changing code.
-BREAKOUT_LOOKBACK = int(os.getenv("BREAKOUT_LOOKBACK", "10"))             # bars for breakout check (5m)
-VOLUME_MULTIPLIER = float(os.getenv("VOLUME_MULTIPLIER", "1.2"))          # 5m vol vs avg
-RSI_MIN = float(os.getenv("RSI_MIN", "35"))
-RSI_MAX = float(os.getenv("RSI_MAX", "65"))
-USE_EMA_CROSS = os.getenv("USE_EMA_CROSS", "1") == "1"                    # allow 5m EMA20 cross entries
+# strategy thresholds (tunable via env)
+BREAKOUT_LOOKBACK  = int(os.getenv("BREAKOUT_LOOKBACK", "10"))
+VOLUME_MULTIPLIER  = float(os.getenv("VOLUME_MULTIPLIER", "1.2"))
+RSI_MIN            = float(os.getenv("RSI_MIN", "35"))
+RSI_MAX            = float(os.getenv("RSI_MAX", "65"))
+USE_EMA_CROSS      = os.getenv("USE_EMA_CROSS", "1") == "1"
 
-# ---------------------------------------------------------------------------
 tz = pytz.timezone(TIMEZONE)
 logging.basicConfig(level=logging.INFO)
 BINANCE = "https://api.binance.com"
@@ -142,7 +141,7 @@ def intraday_signal(symbol):
     trend_up = c1[-1] > ema50_1h[-1]
     trend_dn = c1[-1] < ema50_1h[-1]
 
-    # breakout on 5m with shorter lookback
+    # breakout on 5m (shorter lookback)
     hh = max(h5[-(BREAKOUT_LOOKBACK+1):-1])
     ll = min(l5[-(BREAKOUT_LOOKBACK+1):-1])
     vol_avg = sum(v5[-(BREAKOUT_LOOKBACK+1):-1]) / BREAKOUT_LOOKBACK
@@ -317,6 +316,10 @@ def main():
         raise RuntimeError("Missing TELEGRAM_MANUAL_TOKEN")
 
     updater = Updater(TOKEN, use_context=True)
+
+    # *** important fix: clear webhook so polling won't conflict ***
+    updater.bot.delete_webhook(drop_pending_updates=True)
+
     dp = updater.dispatcher
     dp.add_handler(CommandHandler("start", cmd_start))
     dp.add_handler(CommandHandler("ping", cmd_ping))
