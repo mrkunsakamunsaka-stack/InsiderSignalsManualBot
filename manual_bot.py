@@ -1,16 +1,13 @@
 # manual_bot.py — Coinbase • Auto-Trading + Live Config Commands
 # 2025-08-09
-# New:
-# - /setmax 1..20            -> MAX_OPEN_TRADES
-# - /setalloc 1..100         -> POSITION_PCT (% of free USD per trade)
-# - /setscore 1..100         -> SCORE_MIN
-# - /setmode RELAXED|STRICT  -> runtime strategy preset
-# - /getconfig               -> show current settings
-#
-# Notes:
-# - Settings persist to config.json (local file) and apply immediately.
-# - STRICT/RELAXED adjust filters/gates; you can still tweak env vars if needed.
-# - LIVE mode still executes LONG-only on spot; SHORT is skipped (messaged).
+# Features:
+# - Coinbase USD/USDT scanner (5m/15m/1h; 4h only if enabled and available)
+# - Telegram alerts with score, entry, TP/SL
+# - Auto-trading (Coinbase Advanced Trade): PAPER (default) or LIVE (LONG-only on spot)
+# - Live config from Telegram: /setmax /setalloc /setscore /setmode /getconfig
+# - Persistent config in config.json, survives restarts
+# - Score filter (skip weak setups), cooldown per pair, max open orders, balance checks
+# - Graceful skips when no balance; no spammy 4h errors
 
 import os, time, math, random, logging, threading, http.server, socketserver, json, hmac, hashlib, base64, uuid
 from datetime import datetime, timedelta, time as dtime
@@ -91,7 +88,7 @@ CB_AT   = "https://api.coinbase.com"           # Advanced Trade v3
 
 GRAN_5M, GRAN_15M, GRAN_1H, GRAN_4H = 300, 900, 3600, 4*3600
 session = requests.Session()
-session.headers.update({"User-Agent": "insider-autotrade-bot/1.1"})
+session.headers.update({"User-Agent": "insider-autotrade-bot/1.2"})
 
 # ------------------------------- state ---------------------------------------
 signals = []
@@ -130,7 +127,7 @@ def save_config():
 
 load_config()
 
-# --- active strategy params (mutable at runtime via MODE) ---
+# --- apply mode to globals ---
 def apply_mode(mode: str):
     mode = (mode or "RELAXED").upper()
     params = RELAXED_DEFAULTS if mode == "RELAXED" else STRICT_DEFAULTS
@@ -334,8 +331,7 @@ def score_signal(side, price, ema50_now, atr5, vol_ok, rsi_val, adx_val):
     score = 0
     if vol_ok: score += 25
     if adx_val is not None and not math.isnan(adx_val):
-        # relaxed base; STRICT has higher ADX_MIN upstream
-        score += min(25, max(0, (adx_val - 10) * 2))
+        score += min(25, max(0, (adx_val - 10) * 2))  # base for relaxed; STRICT raises ADX_MIN upstream
     if ema50_now:
         dist = abs(price - ema50_now)/ema50_now
         score += max(0, 25 - 100*dist)
@@ -370,9 +366,10 @@ def intraday_signal(pid):
     if globals().get("USE_ADX_FILTER", True):
         adx_ok = (adx1h is not None and not math.isnan(adx1h[-1]) and adx1h[-1] >= globals().get("ADX_MIN", 10))
 
-    hh = max(h5[-(globals().get("BREAKOUT_LOOKBACK",3)+1):-1])
-    ll = min(l5[-(globals().get("BREAKOUT_LOOKBACK",3)+1):-1])
-    vol_avg = sum(v5[-(globals().get("BREAKOUT_LOOKBACK",3)+1):-1]) / globals().get("BREAKOUT_LOOKBACK",3)
+    BL = globals().get("BREAKOUT_LOOKBACK",3)
+    hh = max(h5[-(BL+1):-1])
+    ll = min(l5[-(BL+1):-1])
+    vol_avg = sum(v5[-(BL+1):-1]) / BL
     last_close = c5[-1]; last_vol = v5[-1]
 
     r = rsi(c15, 14)
@@ -475,7 +472,8 @@ def cmd_start(update: Update, ctx: CallbackContext):
               "/setmode RELAXED|STRICT\n"
               "/signals – recent signals (24h)\n"
               "/status – open trades\n"
-              "/scan – scan now"),
+              "/scan – scan now\n"
+              "/ping – bot health"),
         parse_mode=ParseMode.HTML
     )
 
@@ -528,8 +526,9 @@ def cmd_setmode(update: Update, ctx: CallbackContext):
 
 def cmd_ping(update: Update, ctx: CallbackContext):
     now = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
+    cfg = CONFIG
     ctx.bot.send_message(chat_id=target_chat_id(update),
-        text=f"✅ Bot alive: {now} {TIMEZONE} | {CONFIG['MODE']} | SCORE_MIN={CONFIG['SCORE_MIN']} | MAX_OPEN_TRADES={CONFIG['MAX_OPEN_TRADES']}")
+        text=f"✅ Bot alive: {now} {TIMEZONE} | {cfg['MODE']} | SCORE_MIN={cfg['SCORE_MIN']} | MAX_OPEN_TRADES={cfg['MAX_OPEN_TRADES']}")
 
 def cmd_signals(update: Update, ctx: CallbackContext):
     chat_id = target_chat_id(update)
