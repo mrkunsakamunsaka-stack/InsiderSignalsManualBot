@@ -5,49 +5,47 @@ services:
     plan: free
     autoDeploy: true
     dockerfilePath: ./Dockerfile
-
     envVars:
-      # REQUIRED — replace with your real token
       - key: TELEGRAM_MANUAL_TOKEN
-        value: 8411524534:AAHppQZKZBNpSTvvX81s9RAUdlVTCTvaiVc
+        value: "8411524534:AAHppQZKZBNpSTvvX81s9RAUdlVTCTvaiVc"
 
-      # Label for messages
       - key: MODE
         value: RELAXED
 
-      # Timezone & daily report hour
       - key: TIMEZONE
         value: Europe/Dublin
       - key: DAILY_REPORT_HOUR
         value: "20"
 
-      # RELAXED scanning
-      - key: SCAN_INTERVAL_SECONDS
-        value: "30"
+      # --- activity & coverage ---
+      - key: MIN_SCORE
+        value: "80"
       - key: SYMBOLS_PER_SCAN
-        value: "30"
+        value: "120"
+      - key: SCAN_INTERVAL_SECONDS
+        value: "20"
       - key: SIGNAL_COOLDOWN_MINUTES
-        value: "8"
+        value: "6"
       - key: MAX_PAIRS
         value: "0"
 
-      # RELAXED gates
+      # --- looser gates ---
       - key: BREAKOUT_LOOKBACK
-        value: "3"
+        value: "2"
       - key: VOLUME_MULTIPLIER
-        value: "1.05"
+        value: "1.00"
       - key: RSI_MIN
-        value: "20"
+        value: "15"
       - key: RSI_MAX
-        value: "80"
+        value: "85"
       - key: USE_EMA_CROSS
         value: "1"
       - key: EMA_TOL_PCT
-        value: "0.012"
+        value: "0.02"
 
-      # Filters (looser)
+      # --- filters ---
       - key: USE_ADX_FILTER
-        value: "1"
+        value: "0"
       - key: ADX_MIN
         value: "10"
       - key: USE_HTF_FILTER
@@ -55,7 +53,7 @@ services:
       - key: USE_BTC_BIAS
         value: "0"
 
-      # Risk / exits
+      # --- targets/risk (unchanged) ---
       - key: R_TP1
         value: "1.1"
       - key: R_TP2
@@ -65,13 +63,13 @@ services:
       - key: TRAIL_AFTER_TP1
         value: "1"
 
-      # Keep-alive (put YOUR service URL here)
+      # --- keep-alive ---
       - key: KEEPALIVE_URL
-        value: https://insidersignalsmanual-ybsp.onrender.com
+        value: "https://insidersignalsmanual-ybsp.onrender.com"
       - key: KEEPALIVE_SECONDS
         value: "240"
 
-      # Robust retries / jitter
+      # --- retry/jitter ---
       - key: RETRY_MAX
         value: "4"
       - key: RETRY_BASE_DELAY
