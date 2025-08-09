@@ -1,17 +1,32 @@
-# add under envVars:
-  - key: SYMBOLS_PER_SCAN
-    value: "10"
-  - key: SCAN_INTERVAL_SECONDS
-    value: "60"
-  - key: SIGNAL_COOLDOWN_MINUTES
-    value: "10"
-  - key: BREAKOUT_LOOKBACK
-    value: "10"
-  - key: VOLUME_MULTIPLIER
-    value: "1.2"
-  - key: RSI_MIN
-    value: "35"
-  - key: RSI_MAX
-    value: "65"
-  - key: USE_EMA_CROSS
-    value: "1"
+services:
+  - type: web
+    name: InsiderSignalsManual
+    env: docker
+    plan: free
+    autoDeploy: true
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: TELEGRAM_MANUAL_TOKEN
+        value: "8411524534:AAHm2EYBRLmWKmUGAc5PJ5KH8vXHPGqRjoM"
+      - key: TIMEZONE
+        value: Europe/Dublin
+      - key: DAILY_REPORT_HOUR
+        value: "20"
+
+      # --- strategy & scanning knobs ---
+      - key: SYMBOLS_PER_SCAN
+        value: "10"
+      - key: SCAN_INTERVAL_SECONDS
+        value: "60"
+      - key: SIGNAL_COOLDOWN_MINUTES
+        value: "10"
+      - key: BREAKOUT_LOOKBACK
+        value: "10"
+      - key: VOLUME_MULTIPLIER
+        value: "1.2"
+      - key: RSI_MIN
+        value: "35"
+      - key: RSI_MAX
+        value: "65"
+      - key: USE_EMA_CROSS
+        value: "1"
