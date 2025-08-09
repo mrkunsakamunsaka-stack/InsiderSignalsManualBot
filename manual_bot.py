@@ -1,33 +1,52 @@
+# manual_bot.py
+# InsiderSignals_Manual – Telegram signals-only bot
+# Works on Render free plan as a Web Service (keeps an HTTP port open)
+
 import os
 import logging
 from datetime import datetime, timedelta, time as dtime
 import pytz
+
+# --- Telegram bot (python-telegram-bot v13) ---
 from telegram import Update, ParseMode
 from telegram.ext import Updater, CommandHandler, CallbackContext, JobQueue
 
+# --- keep-alive web server so Render Web Service stays running ---
+import threading, http.server, socketserver
+
+PORT = int(os.getenv("PORT", "10000"))  # Render provides PORT
+class _Handler(http.server.SimpleHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+def _start_http():
+    with socketserver.TCPServer(("", PORT), _Handler) as httpd:
+        httpd.serve_forever()
+
+# start keep-alive server in background thread
+threading.Thread(target=_start_http, daemon=True).start()
+
 # ============== BASIC SETUP ==============
 logging.basicConfig(level=logging.INFO)
-TOKEN = os.getenv("TELEGRAM_MANUAL_TOKEN")  # <-- put this in Render (do NOT paste here)
+TOKEN = os.getenv("TELEGRAM_MANUAL_TOKEN")  # set this in render.yaml envVars
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Dublin")
 DAILY_REPORT_HOUR = int(os.getenv("DAILY_REPORT_HOUR", "20"))
 
-# Optional: force-send to a specific chat ID (e.g., your private chat or a channel ID)
-# If not set, the bot will send to the last chat that used /start
-FORCED_CHAT_ID = os.getenv("CHAT_ID")  # like "123456789" or "-100123456789" for channels
+# Optional: force a destination chat/channel id (numeric).
+# If not set, the bot sends to whichever chat used /start last.
+FORCED_CHAT_ID = os.getenv("CHAT_ID")  # e.g. "123456789" or "-100123456789" for channels
 
 tz = pytz.timezone(TIMEZONE)
 
-# In-memory signals store (simple demo)
+# in-memory store (demo)
 signals = []
-last_chat_id = None  # we remember who pressed /start (if CHAT_ID not set)
+last_chat_id = None  # remembers who pressed /start last
 
 # ============== HELPERS ==============
 def target_chat_id(update: Update = None) -> int:
-    """
-    Decide where to send messages:
-    1) If FORCED_CHAT_ID is set, use it.
-    2) Else use where the user typed /start most recently.
-    """
+    """Where to send messages."""
     global last_chat_id
     if FORCED_CHAT_ID:
         return int(FORCED_CHAT_ID)
@@ -54,9 +73,9 @@ def start(update: Update, context: CallbackContext):
     context.bot.send_message(
         chat_id=chat_id,
         text=(
-            "👋 Welcome to <b>InsiderSignals_Manual</b>.\n\n"
-            "You’ll receive watchlist alerts, confirmed trade signals (Entry / TP / SL), "
-            "Ripple legal/banking news summaries, and a daily report at 20:00.\n\n"
+            "👋 Welcome to <b>InsiderSignals_Manual</b>\n\n"
+            "You’ll get watchlist alerts, confirmed trade signals (Entry/TP/SL), "
+            "Ripple/Moodeng news summaries, and a daily performance report at 20:00.\n\n"
             "Commands:\n"
             "/signals – show active signals\n"
             "/ping – check bot is alive\n"
@@ -72,9 +91,9 @@ def help_cmd(update: Update, context: CallbackContext):
         text=(
             "🆘 <b>Help</b>\n\n"
             "/start – register this chat for alerts\n"
-            "/signals – list current active demo signals\n"
+            "/signals – list current demo signals\n"
             "/ping – bot health check\n\n"
-            "Daily performance report is sent every day at 20:00 (your timezone setting)."
+            "Daily performance report is sent every day at 20:00."
         ),
         parse_mode=ParseMode.HTML
     )
@@ -98,7 +117,7 @@ def list_signals(update: Update, context: CallbackContext):
 
 # ============== JOBS (BACKGROUND TASKS) ==============
 def generate_demo_signal(context: CallbackContext):
-    """Demo signal every 6 hours. Replace with real scanner later."""
+    """Demo signal every 6 hours. Replace with your real scanner later."""
     chat_id = target_chat_id()
     if not chat_id:
         return  # nobody pressed /start yet and no CHAT_ID set
@@ -125,7 +144,10 @@ def send_daily_report(context: CallbackContext):
         lines = ["📊 <b>Daily Report</b> (last 24h)"]
         for s in recent:
             t = s["time"].strftime("%H:%M")
-            lines.append(f"• {t} {s['coin']} – Entry {s['entry']} | TP {', '.join(map(str, s['tp']))} | SL {s['sl']}")
+            lines.append(
+                f"• {t} {s['coin']} – Entry {s['entry']} | "
+                f"TP {', '.join(map(str, s['tp']))} | SL {s['sl']}"
+            )
         msg = "\n".join(lines)
     context.bot.send_message(chat_id=chat_id, text=msg, parse_mode=ParseMode.HTML)
 
@@ -144,12 +166,11 @@ def main():
 
     jq: JobQueue = updater.job_queue
 
-    # Demo: generate a signal every 6 hours
-    jq.run_repeating(generate_demo_signal, interval=6*60*60, first=10)
+    # Demo: generate a signal every 6 hours (first run after 10s)
+    jq.run_repeating(generate_demo_signal, interval=6 * 60 * 60, first=10)
 
     # Daily report at 20:00 in your timezone
-    hour = DAILY_REPORT_HOUR
-    send_time = dtime(hour=hour, minute=0, tzinfo=tz)
+    send_time = dtime(hour=DAILY_REPORT_HOUR, minute=0, tzinfo=tz)
     jq.run_daily(send_daily_report, time=send_time)
 
     logging.info("InsiderSignals_Manual started.")
