@@ -6,7 +6,7 @@ services:
     autoDeploy: true
     dockerfilePath: ./Dockerfile
     envVars:
-      - key: TELEGRAM_MANUAL_TOKEN
+      - key: 8411524534: AAHm2EYBRLmWKmUGAc5PJ5KH8 vXHPGqRjoM
         fromSecret: TELEGRAM_MANUAL_TOKEN
       - key: TIMEZONE
         value: Europe/Dublin
