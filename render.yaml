@@ -7,15 +7,15 @@ services:
     dockerfilePath: ./Dockerfile
 
     envVars:
-      # REQUIRED — replace with your real token (no spaces)
+      # REQUIRED — replace with your real token
       - key: TELEGRAM_MANUAL_TOKEN
-        value: "8411524534:AAHppQZKZBNpSTvvX81s9RAUdlVTCTvaiVc"
+        value: 8411524534:AAHppQZKZBNpSTvvX81s9RAUdlVTCTvaiVc
 
-      # label for messages
+      # Label for messages
       - key: MODE
         value: RELAXED
 
-      # timezone & daily report hour
+      # Timezone & daily report hour
       - key: TIMEZONE
         value: Europe/Dublin
       - key: DAILY_REPORT_HOUR
@@ -67,7 +67,7 @@ services:
 
       # Keep-alive (put YOUR service URL here)
       - key: KEEPALIVE_URL
-        value: "https://insidersignalsmanual-ybsp.onrender.com"
+        value: https://insidersignalsmanual-ybsp.onrender.com
       - key: KEEPALIVE_SECONDS
         value: "240"
 
