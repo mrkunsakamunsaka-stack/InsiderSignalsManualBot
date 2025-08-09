@@ -1,4 +1,6 @@
 # manual_bot.py — Coinbase (USD/USDT) • Relaxed/Pro-Desk selectable via MODE
+# 2025-08-09: fix 4h granularity errors -> only request 4h when needed;
+#             remember pairs without 4h and skip future 4h requests.
 
 import os, time, math, random, logging, threading, http.server, socketserver
 from datetime import datetime, timedelta, time as dtime
@@ -20,10 +22,10 @@ threading.Thread(target=_keepalive, daemon=True).start()
 
 # ------------------------------- settings --------------------------------
 TOKEN = os.getenv("TELEGRAM_MANUAL_TOKEN")
-MODE = os.getenv("MODE", "").strip()  # eg. RELAXED (only for display)
+MODE = os.getenv("MODE", "").strip()
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Dublin")
 DAILY_REPORT_HOUR = int(os.getenv("DAILY_REPORT_HOUR", "20"))
-FORCED_CHAT_ID = os.getenv("CHAT_ID")  # optional numeric id
+FORCED_CHAT_ID = os.getenv("CHAT_ID")
 
 # cadence / rotation
 SCAN_INTERVAL_SECONDS   = int(os.getenv("SCAN_INTERVAL_SECONDS", "30"))
@@ -42,9 +44,9 @@ EMA_TOL_PCT        = float(os.getenv("EMA_TOL_PCT", "0.012"))
 # filters
 USE_ADX_FILTER     = os.getenv("USE_ADX_FILTER", "1") == "1"
 ADX_MIN            = float(os.getenv("ADX_MIN", "10"))
-USE_HTF_FILTER     = os.getenv("USE_HTF_FILTER", "0") == "1"   # relaxed default off
+USE_HTF_FILTER     = os.getenv("USE_HTF_FILTER", "0") == "1"   # default OFF in relaxed
 HTF_TOL_PCT        = float(os.getenv("HTF_TOL_PCT", "0.005"))
-USE_BTC_BIAS       = os.getenv("USE_BTC_BIAS", "0") == "1"     # relaxed default off
+USE_BTC_BIAS       = os.getenv("USE_BTC_BIAS", "0") == "1"     # default OFF in relaxed
 
 # risk / exits (R = ATR(5m))
 R_TP1              = float(os.getenv("R_TP1", "1.1"))
@@ -69,7 +71,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(mes
 CB_BASE = "https://api.exchange.coinbase.com"
 GRAN_5M, GRAN_15M, GRAN_1H, GRAN_4H = 300, 900, 3600, 4*3600
 session = requests.Session()
-session.headers.update({"User-Agent": "insider-relaxed-bot/1.0"})
+session.headers.update({"User-Agent": "insider-relaxed-bot/1.1"})
 
 # ------------------------------- state ---------------------------------------
 signals = []
@@ -78,6 +80,9 @@ watchlist_symbols = []
 scan_cursor = 0
 last_chat_id = None
 BTC_STATE = {"bias": 0, "ts": 0}
+
+# remember pairs that don't support 4h so we never ask again
+NO_4H = set()
 
 # ---------------------------- indicators -------------------------------------
 def ema(arr, period):
@@ -210,7 +215,6 @@ def illiquid(o5,h5,l5,c5):
     return rng < 0.0005
 
 def update_btc_bias():
-    # relaxed build keeps bias off by default unless env turns it on
     if not USE_BTC_BIAS:
         BTC_STATE.update({"bias": 0, "ts": time.time()}); return
     now = time.time()
@@ -231,7 +235,7 @@ def score_signal(side, price, ema50_now, atr5, vol_ok, rsi_val, adx_val):
     score = 0
     if vol_ok: score += 25
     if adx_val is not None and not math.isnan(adx_val):
-        score += min(25, max(0, (adx_val - 10) * 2))  # relaxed base
+        score += min(25, max(0, (adx_val - 10) * 2))
     if ema50_now:
         dist = abs(price - ema50_now)/ema50_now
         score += max(0, 25 - 100*dist)
@@ -246,13 +250,21 @@ def intraday_signal(pid):
 
     o15,h15,l15,c15,v15 = cb_candles(pid, GRAN_15M, 200)
     o1,h1,l1,c1,v1      = cb_candles(pid, GRAN_1H, 200)
-    o4h,h4h,l4h,c4h,v4h = cb_candles(pid, GRAN_4H, 200)
+
+    # Only request 4h if HTF filter is enabled and we haven't flagged this pair
+    c4h = None
+    if USE_HTF_FILTER and pid not in NO_4H:
+        o4h,h4h,l4h,c4h,v4h = cb_candles(pid, GRAN_4H, 200)
+        if not c4h:
+            NO_4H.add(pid)
+            logging.info(f"{pid} has no 4h granularity — skipping 4h checks hereafter.")
 
     ema50_1h  = ema(c1, 50)
     ema200_1h = ema(c1, 200)
-    ema200_4h = ema(c4h, 200) if c4h else None
-    if ema50_1h is None or ema200_1h is None or ema200_4h is None: return None
+    if ema50_1h is None or ema200_1h is None: return None
     ema50_now = ema50_1h[-1]
+
+    ema200_4h = ema(c4h, 200) if c4h else None
 
     adx1h = adx(h1, l1, c1, 14) if c1 else None
     adx_ok = True
@@ -279,10 +291,15 @@ def intraday_signal(pid):
     trend_up = (last_close > ema50_now) or near_trend_ok(last_close, ema50_now, EMA_TOL_PCT)
     trend_dn = (last_close < ema50_now) or near_trend_ok(last_close, ema50_now, EMA_TOL_PCT)
 
+    # HTF filter — only applied if enabled AND 4h data exists for this pair
     htf_up = True; htf_dn = True
     if USE_HTF_FILTER:
-        htf_up = (c1[-1] >= (1-HTF_TOL_PCT)*ema200_1h[-1]) and (c4h[-1] >= (1-HTF_TOL_PCT)*ema200_4h[-1])
-        htf_dn = (c1[-1] <= (1+HTF_TOL_PCT)*ema200_1h[-1]) and (c4h[-1] <= (1+HTF_TOL_PCT)*ema200_4h[-1])
+        if ema200_4h is not None:
+            htf_up = (c1[-1] >= (1-HTF_TOL_PCT)*ema200_1h[-1]) and (c4h[-1] >= (1-HTF_TOL_PCT)*ema200_4h[-1])
+            htf_dn = (c1[-1] <= (1+HTF_TOL_PCT)*ema200_1h[-1]) and (c4h[-1] <= (1+HTF_TOL_PCT)*ema200_4h[-1])
+        else:
+            # No 4h for this pair => don't gate on HTF to avoid errors
+            htf_up = True; htf_dn = True
 
     vol_ok = last_vol >= VOLUME_MULTIPLIER * max(vol_avg, 1e-9)
 
