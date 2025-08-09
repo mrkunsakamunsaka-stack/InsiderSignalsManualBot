@@ -1,0 +1,17 @@
+services:
+  - type: worker
+    name: InsiderSignalsManual
+    env: docker
+    plan: free
+    autoDeploy: true
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: TELEGRAM_MANUAL_TOKEN
+        fromSecret: TELEGRAM_MANUAL_TOKEN
+      - key: TIMEZONE
+        value: Europe/Dublin
+      - key: DAILY_REPORT_HOUR
+        value: "20"
+      # Optional: set CHAT_ID to force where messages go (your user id or channel id)
+      # - key: CHAT_ID
+      #   value: "123456789"
