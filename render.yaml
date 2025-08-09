@@ -7,7 +7,7 @@ services:
     dockerfilePath: ./Dockerfile
     envVars:
       - key: TELEGRAM_MANUAL_TOKEN
-        value: "8411524534:AAHm2EYBRLmWKmUGAc5PJ5KH8vXHPGqRjoM"
+        value: "8411524534:AAHppQZKZBNpSTvvX81s9RAU dIVTCTvaiVc"
       - key: TIMEZONE
         value: Europe/Dublin
       - key: DAILY_REPORT_HOUR
