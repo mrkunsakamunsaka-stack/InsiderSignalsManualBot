@@ -1,17 +1,12 @@
 # manual_bot.py
-# InsiderSignals_Manual — Intraday signals (5m/15m/1h) for top-50 USDT pairs
-# Binance public API (no key). Render free-friendly (web service with keep-alive).
+# InsiderSignals_Manual — Intraday signals (5m/15m/1h) using Coinbase Exchange
+# Public API (no key). Render free-friendly (web service with keep-alive).
 
 import os, time, math, logging, threading, http.server, socketserver
 from datetime import datetime, timedelta, time as dtime
 import pytz, requests, numpy as np
 from telegram import Update, ParseMode
 from telegram.ext import Updater, CommandHandler, CallbackContext, JobQueue
-
-# ========================
-# HARDCODED TELEGRAM TOKEN
-# ========================
-TELEGRAM_TOKEN = "8411524534:AAHppQZKZBNpSTvvX81s9RAUdlVTCTvaiVc"
 
 # ---------- keep-alive HTTP server (keeps Render Web Service running) ----------
 PORT = int(os.getenv("PORT", "10000"))
@@ -24,7 +19,8 @@ def _keepalive():
 threading.Thread(target=_keepalive, daemon=True).start()
 # ------------------------------------------------------------------------------
 
-# -------------------- settings (can still be overridden via env) ----------------
+# -------------------- settings (read from Environment / render.yaml) ----------
+TOKEN = os.getenv("TELEGRAM_MANUAL_TOKEN")  # <- make sure it's set in render.yaml
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Dublin")
 DAILY_REPORT_HOUR = int(os.getenv("DAILY_REPORT_HOUR", "20"))
 FORCED_CHAT_ID = os.getenv("CHAT_ID")  # optional numeric id
@@ -43,12 +39,16 @@ USE_EMA_CROSS      = os.getenv("USE_EMA_CROSS", "1") == "1"
 
 tz = pytz.timezone(TIMEZONE)
 logging.basicConfig(level=logging.INFO)
-BINANCE = "https://api.binance.com"
+
+# -------------------- Coinbase endpoints --------------------
+CB_BASE = "https://api.exchange.coinbase.com"  # a.k.a. coinbase exchange (ex pro)
+# granularity in SECONDS: 300=5m, 900=15m, 3600=1h
+GRAN_5M, GRAN_15M, GRAN_1H = 300, 900, 3600
 
 # -------------------- state --------------------
 signals = []                 # for /signals + daily report
 last_signal_time = {}        # symbol -> datetime
-watchlist_symbols = []       # top 50 list
+watchlist_symbols = []       # top 50 list (product_ids like "BTC-USD")
 scan_cursor = 0              # rotating window index
 last_chat_id = None
 
@@ -89,56 +89,86 @@ def atr(h, l, c, period=14):
     pad = len(tr) - len(a)
     return np.concatenate([np.full(pad, np.nan), np.array(a)])
 
-# -------------------- binance helpers --------------------
-def get_top50_usdt_symbols():
-    """Top-50 USDT spot pairs by 24h quote volume (exclude UP/DOWN/BULL/BEAR)."""
+# -------------------- Coinbase helpers --------------------
+def get_top50_pairs():
+    """
+    Build a top list from Coinbase products.
+    We take products with quote USD or USDT, status=online, trading_enabled=True.
+    Coinbase /products returns lots of meta in one call; we avoid per-product calls.
+    """
     try:
-        data = requests.get(f"{BINANCE}/api/v3/ticker/24hr", timeout=10).json()
-        filt = [d for d in data
-                if d.get("symbol","").endswith("USDT")
-                and all(x not in d["symbol"] for x in ["UP","DOWN","BULL","BEAR"])]
-        filt.sort(key=lambda x: float(x.get("quoteVolume","0")), reverse=True)
-        return [d["symbol"] for d in filt[:50]]
+        r = requests.get(f"{CB_BASE}/products", headers={"User-Agent": "insider-bot/1.0"}, timeout=15)
+        r.raise_for_status()
+        products = r.json()
+        # Filter spot products tradable now
+        filt = []
+        for p in products:
+            if p.get("status") != "online": 
+                continue
+            if not p.get("trading_disabled") in (False, None):
+                continue
+            qc = (p.get("quote_currency") or "").upper()
+            if qc not in ("USD", "USDT"):
+                continue
+            pid = p.get("id")  # e.g., "BTC-USD"
+            if not pid:
+                continue
+            filt.append(p)
+        # Prefer USD over USDT, then by display_name alphabetical; truncate to 60 then 50
+        filt.sort(key=lambda x: (0 if x.get("quote_currency")=="USD" else 1, x.get("base_currency","")))
+        pairs = [p["id"] for p in filt[:50]]
+        if not pairs:
+            raise RuntimeError("No Coinbase USD/USDT pairs found")
+        return pairs
     except Exception as e:
-        logging.error(f"top50 error: {e}")
-        return ["BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","XLMUSDT"]
+        logging.error(f"coinbase get_top50_pairs error: {e}")
+        # very safe fallback set
+        return [
+            "BTC-USD","ETH-USD","SOL-USD","XRP-USD","ADA-USD","DOGE-USD","AVAX-USD",
+            "LINK-USD","MATIC-USD","DOT-USD","LTC-USD","BCH-USD","ATOM-USD","APT-USD",
+            "ARB-USD","OP-USD","SUI-USD","NEAR-USD","AAVE-USD","UNI-USD","ETC-USD",
+            "ALGO-USD","FIL-USD","HBAR-USD","RNDR-USD","ICP-USD","EGLD-USD","MANA-USD",
+            "SAND-USD","FTM-USD","IMX-USD","GRT-USD","INJ-USD","PEPE-USD","SEI-USD",
+            "TIA-USD","BONK-USD","JTO-USD","PYTH-USD","WIF-USD","ENS-USD","RUNE-USD",
+            "KAS-USD","JUP-USD","HBAR-USD","STRK-USD","WLD-USD","XLM-USD","SHIB-USD","AR-USD"
+        ][:50]
 
-def get_klines(symbol, interval, limit=200, retries=3):
-    """Return (opens, highs, lows, closes, volumes) or all None on failure."""
-    for attempt in range(retries):
-        try:
-            r = requests.get(
-                f"{BINANCE}/api/v3/klines",
-                params={"symbol": symbol, "interval": interval, "limit": limit},
-                headers={"User-Agent": "insider-bot/1.0"},
-                timeout=10,
-            )
-            data = r.json()
-
-            # Binance may return an error object; detect and raise
-            if isinstance(data, dict):
-                raise Exception(f"Binance error: {data.get('msg','unknown')}")
-
-            opens  = [float(x[1]) for x in data]
-            highs  = [float(x[2]) for x in data]
-            lows   = [float(x[3]) for x in data]
-            closes = [float(x[4]) for x in data]
-            vols   = [float(x[5]) for x in data]
-            return opens, highs, lows, closes, vols
-
-        except Exception as e:
-            logging.error(f"get_klines error {symbol} {interval}: {e}")
-            time.sleep(0.6 + 0.6*attempt)  # gentle backoff
-
-    return None, None, None, None, None
+def cb_candles(product_id, granularity, limit=300):
+    """
+    Coinbase candles: GET /products/{product_id}/candles?granularity=SEC
+    Returns arrays: [time, low, high, open, close, volume]
+    Sorted newest->oldest by default; we sort ascending for indicators.
+    """
+    try:
+        r = requests.get(
+            f"{CB_BASE}/products/{product_id}/candles",
+            params={"granularity": granularity},
+            headers={"User-Agent": "insider-bot/1.0"},
+            timeout=15
+        )
+        r.raise_for_status()
+        data = r.json()
+        if not isinstance(data, list) or not data:
+            return None, None, None, None, None
+        data.sort(key=lambda x: x[0])  # oldest -> newest
+        t, low, high, op, close, vol = zip(*[(d[0], d[1], d[2], d[3], d[4], d[5]) for d in data[-limit:]])
+        opens  = [float(x) for x in op]
+        highs  = [float(x) for x in high]
+        lows   = [float(x) for x in low]
+        closes = [float(x) for x in close]
+        vols   = [float(x) for x in vol]
+        return opens, highs, lows, closes, vols
+    except Exception as e:
+        logging.error(f"coinbase candles error {product_id} g{granularity}: {e}")
+        return None, None, None, None, None
 
 # -------------------- strategy (intraday 5m/15m/1h) --------------------
-def intraday_signal(symbol):
-    """Return dict signal or None."""
-    o5,h5,l5,c5,v5 = get_klines(symbol, "5m", 200)
+def intraday_signal(product_id):
+    """Return dict signal or None for Coinbase product_id like 'BTC-USD'."""
+    o5,h5,l5,c5,v5 = cb_candles(product_id, GRAN_5M, 200)
     if not c5: return None
-    o15,h15,l15,c15,v15 = get_klines(symbol, "15m", 200)
-    o1,h1,l1,c1,v1 = get_klines(symbol, "1h", 200)
+    o15,h15,l15,c15,v15 = cb_candles(product_id, GRAN_15M, 200)
+    o1,h1,l1,c1,v1 = cb_candles(product_id, GRAN_1H, 200)
 
     ema50_1h = ema(c1, 50)
     if ema50_1h is None: return None
@@ -187,7 +217,7 @@ def intraday_signal(symbol):
         sl = entry + 1.5*a5; tp1 = entry - 1.0*a5; tp2 = entry - 2.0*a5
 
     return {
-        "symbol": symbol, "side": side,
+        "symbol": product_id, "side": side,
         "entry": round(entry, 6), "tp1": round(tp1, 6),
         "tp2": round(tp2, 6), "sl": round(sl, 6),
         "atr": round(a5, 6)
@@ -216,8 +246,8 @@ def format_signal_msg(sig):
 def cmd_start(update: Update, ctx: CallbackContext):
     ctx.bot.send_message(
         chat_id=target_chat_id(update),
-        text=("👋 InsiderSignals_Manual (Intraday)\n"
-              "Real signals for top-50 USDT pairs.\n\n"
+        text=("👋 InsiderSignals_Manual (Coinbase)\n"
+              "Real signals for top USD/USDT pairs.\n\n"
               "Commands:\n"
               "/ping – bot health\n"
               "/signals – recent signals (24h)\n"
@@ -244,25 +274,25 @@ def cmd_signals(update: Update, ctx: CallbackContext):
 
 def cmd_testsignal(update: Update, ctx: CallbackContext):
     now = datetime.now(tz)
-    demo = {"symbol":"XRPUSDT","side":"LONG","entry":0.55,"tp1":0.60,"tp2":0.65,"sl":0.52,"atr":0.01,"time":now}
+    demo = {"symbol":"BTC-USD","side":"LONG","entry":65000,"tp1":65500,"tp2":66500,"sl":64000,"atr":200,"time":now}
     signals.append(demo)
     ctx.bot.send_message(chat_id=target_chat_id(update), text=format_signal_msg(demo), parse_mode=ParseMode.HTML)
 
 def cmd_scan(update: Update, ctx: CallbackContext):
     chat_id = target_chat_id(update)
-    ctx.bot.send_message(chat_id=chat_id, text="🔍 Scanning top-50 now…")
+    ctx.bot.send_message(chat_id=chat_id, text="🔍 Scanning Coinbase top-50 now…")
     _scan_chunk(ctx, push_to=chat_id)
 
 # -------------------- jobs --------------------
 def _ensure_top50():
     global watchlist_symbols
     if not watchlist_symbols:
-        watchlist_symbols = get_top50_usdt_symbols()
-        logging.info(f"Loaded top50: {watchlist_symbols[:10]} ...")
+        watchlist_symbols = get_top50_pairs()
+        logging.info(f"Loaded top list: {watchlist_symbols[:10]} ...")
     return watchlist_symbols
 
 def _scan_chunk(ctx: CallbackContext, push_to=None):
-    """Rotate through top-50 in chunks to respect rate limits."""
+    """Rotate through list in chunks to respect rate limits."""
     global scan_cursor
     chat_id = push_to or target_chat_id()
     if not chat_id:
@@ -278,15 +308,15 @@ def _scan_chunk(ctx: CallbackContext, push_to=None):
     scan_cursor = 0 if end >= len(syms) else end
 
     hits = 0
-    for sym in chunk:
-        last_t = last_signal_time.get(sym)
+    for pid in chunk:
+        last_t = last_signal_time.get(pid)
         if last_t and (now - last_t) < timedelta(minutes=SIGNAL_COOLDOWN_MIN):
             continue
-        sig = intraday_signal(sym)  # internally retries API calls
+        sig = intraday_signal(pid)
         if not sig:
             time.sleep(0.1)
             continue
-        last_signal_time[sym] = now
+        last_signal_time[pid] = now
         rec = {"time": now, **sig}
         signals.append(rec)
         ctx.bot.send_message(chat_id=chat_id, text=format_signal_msg(sig), parse_mode=ParseMode.HTML)
@@ -316,7 +346,10 @@ def job_daily(ctx: CallbackContext):
 
 # -------------------- main --------------------
 def main():
-    updater = Updater(TELEGRAM_TOKEN, use_context=True)
+    if not TOKEN:
+        raise RuntimeError("Missing TELEGRAM_MANUAL_TOKEN")
+
+    updater = Updater(TOKEN, use_context=True)
 
     # clear webhook to avoid polling conflicts
     updater.bot.delete_webhook(drop_pending_updates=True)
@@ -333,7 +366,7 @@ def main():
     send_time = dtime(hour=DAILY_REPORT_HOUR, minute=0, tzinfo=tz)
     jq.run_daily(job_daily, time=send_time)
 
-    logging.info("InsiderSignals_Manual (intraday, hardened) started.")
+    logging.info("InsiderSignals_Manual (Coinbase) started.")
     updater.start_polling()
     updater.idle()
 
