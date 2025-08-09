@@ -1,8 +1,4 @@
-# manual_bot.py — Coinbase (ALL USD/USDT) • Pro-Desk + Robust Retries + Keep-Alive
-# Changes vs previous:
-# - Retries for Coinbase candles (429/5xx/RemoteDisconnected) with backoff + jitter
-# - Random jitter between requests to smooth bursts
-# - Keep-alive pinger job (uses KEEPALIVE_URL every 4 minutes)
+# manual_bot.py — Coinbase (USD/USDT) • Relaxed/Pro-Desk selectable via MODE
 
 import os, time, math, random, logging, threading, http.server, socketserver
 from datetime import datetime, timedelta, time as dtime
@@ -12,7 +8,7 @@ from telegram.ext import Updater, CommandHandler, CallbackContext, JobQueue
 from requests.exceptions import RequestException
 from http.client import RemoteDisconnected
 
-# ---------------- keep-alive HTTP server (Render web service) ----------------
+# ---------------- tiny HTTP server for Render keep-alive ----------------
 PORT = int(os.getenv("PORT", "10000"))
 class _Handler(http.server.SimpleHTTPRequestHandler):
     def do_GET(self):
@@ -22,32 +18,33 @@ def _keepalive():
         httpd.serve_forever()
 threading.Thread(target=_keepalive, daemon=True).start()
 
-# ------------------------------ settings -------------------------------------
+# ------------------------------- settings --------------------------------
 TOKEN = os.getenv("TELEGRAM_MANUAL_TOKEN")
+MODE = os.getenv("MODE", "").strip()  # eg. RELAXED (only for display)
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Dublin")
 DAILY_REPORT_HOUR = int(os.getenv("DAILY_REPORT_HOUR", "20"))
-FORCED_CHAT_ID = os.getenv("CHAT_ID")  # optional numeric id (or -100... channel id)
+FORCED_CHAT_ID = os.getenv("CHAT_ID")  # optional numeric id
 
 # cadence / rotation
-SCAN_INTERVAL_SECONDS   = int(os.getenv("SCAN_INTERVAL_SECONDS", "45"))
-SYMBOLS_PER_SCAN        = int(os.getenv("SYMBOLS_PER_SCAN", "18"))
-SIGNAL_COOLDOWN_MIN     = int(os.getenv("SIGNAL_COOLDOWN_MINUTES", "10"))
-MAX_PAIRS               = int(os.getenv("MAX_PAIRS", "0"))  # 0 = ALL USD/USDT pairs
+SCAN_INTERVAL_SECONDS   = int(os.getenv("SCAN_INTERVAL_SECONDS", "30"))
+SYMBOLS_PER_SCAN        = int(os.getenv("SYMBOLS_PER_SCAN", "30"))
+SIGNAL_COOLDOWN_MIN     = int(os.getenv("SIGNAL_COOLDOWN_MINUTES", "8"))
+MAX_PAIRS               = int(os.getenv("MAX_PAIRS", "0"))  # 0 = ALL USD/USDT
 
-# relaxed entry knobs
-BREAKOUT_LOOKBACK  = int(os.getenv("BREAKOUT_LOOKBACK", "6"))
-VOLUME_MULTIPLIER  = float(os.getenv("VOLUME_MULTIPLIER", "1.1"))
-RSI_MIN            = float(os.getenv("RSI_MIN", "25"))
-RSI_MAX            = float(os.getenv("RSI_MAX", "75"))
+# entry knobs (relaxed defaults)
+BREAKOUT_LOOKBACK  = int(os.getenv("BREAKOUT_LOOKBACK", "3"))
+VOLUME_MULTIPLIER  = float(os.getenv("VOLUME_MULTIPLIER", "1.05"))
+RSI_MIN            = float(os.getenv("RSI_MIN", "20"))
+RSI_MAX            = float(os.getenv("RSI_MAX", "80"))
 USE_EMA_CROSS      = os.getenv("USE_EMA_CROSS", "1") == "1"
-EMA_TOL_PCT        = float(os.getenv("EMA_TOL_PCT", "0.008"))
+EMA_TOL_PCT        = float(os.getenv("EMA_TOL_PCT", "0.012"))
 
-# pro filters
+# filters
 USE_ADX_FILTER     = os.getenv("USE_ADX_FILTER", "1") == "1"
-ADX_MIN            = float(os.getenv("ADX_MIN", "18"))
-USE_HTF_FILTER     = os.getenv("USE_HTF_FILTER", "1") == "1"
+ADX_MIN            = float(os.getenv("ADX_MIN", "10"))
+USE_HTF_FILTER     = os.getenv("USE_HTF_FILTER", "0") == "1"   # relaxed default off
 HTF_TOL_PCT        = float(os.getenv("HTF_TOL_PCT", "0.005"))
-USE_BTC_BIAS       = os.getenv("USE_BTC_BIAS", "1") == "1"
+USE_BTC_BIAS       = os.getenv("USE_BTC_BIAS", "0") == "1"     # relaxed default off
 
 # risk / exits (R = ATR(5m))
 R_TP1              = float(os.getenv("R_TP1", "1.1"))
@@ -55,13 +52,13 @@ R_TP2              = float(os.getenv("R_TP2", "2.2"))
 R_SL               = float(os.getenv("R_SL", "1.1"))
 TRAIL_AFTER_TP1    = os.getenv("TRAIL_AFTER_TP1", "1") == "1"
 
-# keep-alive: set to your public Render URL (e.g., https://insidersignalsmanual-xxxx.onrender.com)
+# keep-alive
 KEEPALIVE_URL      = os.getenv("KEEPALIVE_URL", "").strip()
-KEEPALIVE_SECONDS  = int(os.getenv("KEEPALIVE_SECONDS", "240"))  # 4 minutes
+KEEPALIVE_SECONDS  = int(os.getenv("KEEPALIVE_SECONDS", "240"))
 
-# retry/backoff knobs for Coinbase
+# retries / jitter
 RETRY_MAX          = int(os.getenv("RETRY_MAX", "4"))
-RETRY_BASE_DELAY   = float(os.getenv("RETRY_BASE_DELAY", "0.6"))  # seconds
+RETRY_BASE_DELAY   = float(os.getenv("RETRY_BASE_DELAY", "0.6"))
 REQ_JITTER_MIN_MS  = int(os.getenv("REQ_JITTER_MIN_MS", "50"))
 REQ_JITTER_MAX_MS  = int(os.getenv("REQ_JITTER_MAX_MS", "140"))
 
@@ -70,9 +67,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(mes
 
 # ----------------------------- Coinbase API ----------------------------------
 CB_BASE = "https://api.exchange.coinbase.com"
-GRAN_5M, GRAN_15M, GRAN_1H, GRAN_4H, GRAN_1D = 300, 900, 3600, 4*3600, 24*3600
+GRAN_5M, GRAN_15M, GRAN_1H, GRAN_4H = 300, 900, 3600, 4*3600
 session = requests.Session()
-session.headers.update({"User-Agent": "insider-prodesk-bot/1.1"})
+session.headers.update({"User-Agent": "insider-relaxed-bot/1.0"})
 
 # ------------------------------- state ---------------------------------------
 signals = []
@@ -138,12 +135,9 @@ def adx(high, low, close, period=14):
 
 # --------------------------- data helpers ------------------------------------
 def jitter_sleep():
-    """Small random sleep to avoid bursty patterns."""
-    t = random.randint(REQ_JITTER_MIN_MS, REQ_JITTER_MAX_MS) / 1000.0
-    time.sleep(t)
+    time.sleep(random.randint(REQ_JITTER_MIN_MS, REQ_JITTER_MAX_MS) / 1000.0)
 
 def _get_with_retry(url, params=None, timeout=15):
-    """GET with exponential backoff + jitter for common transient failures."""
     delay = RETRY_BASE_DELAY
     for attempt in range(RETRY_MAX):
         try:
@@ -153,17 +147,15 @@ def _get_with_retry(url, params=None, timeout=15):
             r.raise_for_status()
             return r
         except (RequestException, RemoteDisconnected) as e:
-            if attempt == RETRY_MAX - 1:
-                raise
+            if attempt == RETRY_MAX - 1: raise
             sleep_for = delay * (1.6 ** attempt) + random.uniform(0.05, 0.25)
             logging.warning(f"Retry {attempt+1}/{RETRY_MAX} for {url} ({e}); sleeping {sleep_for:.2f}s")
             time.sleep(sleep_for)
     raise RequestException("unreachable")
 
 def get_coinbase_pairs(limit=0):
-    """All online USD/USDT products (optionally capped)."""
     try:
-        r = _get_with_retry(f"{CB_BASE}/products", timeout=20)
+        r = _get_with_retry("https://api.exchange.coinbase.com/products", timeout=20)
         products = r.json()
         out = []
         for p in products:
@@ -180,17 +172,16 @@ def get_coinbase_pairs(limit=0):
         return ["BTC-USD","ETH-USD","SOL-USD","XRP-USD","ADA-USD"]
 
 def cb_candles(product_id, granularity, limit=300):
-    """Return opens, highs, lows, closes, volumes (ascending) with retries."""
     try:
         jitter_sleep()
         r = _get_with_retry(
-            f"{CB_BASE}/products/{product_id}/candles",
+            f"https://api.exchange.coinbase.com/products/{product_id}/candles",
             params={"granularity": granularity},
             timeout=20
         )
         data = r.json()
         if not isinstance(data, list) or not data: return (None,)*5
-        data.sort(key=lambda x: x[0])  # oldest->newest
+        data.sort(key=lambda x: x[0])
         t, low, high, op, close, vol = zip(*[(d[0],d[1],d[2],d[3],d[4],d[5]) for d in data[-limit:]])
         return list(op), list(high), list(low), list(close), list(vol)
     except Exception as e:
@@ -219,6 +210,7 @@ def illiquid(o5,h5,l5,c5):
     return rng < 0.0005
 
 def update_btc_bias():
+    # relaxed build keeps bias off by default unless env turns it on
     if not USE_BTC_BIAS:
         BTC_STATE.update({"bias": 0, "ts": time.time()}); return
     now = time.time()
@@ -239,7 +231,7 @@ def score_signal(side, price, ema50_now, atr5, vol_ok, rsi_val, adx_val):
     score = 0
     if vol_ok: score += 25
     if adx_val is not None and not math.isnan(adx_val):
-        score += min(25, max(0, (adx_val - 15) * 2))
+        score += min(25, max(0, (adx_val - 10) * 2))  # relaxed base
     if ema50_now:
         dist = abs(price - ema50_now)/ema50_now
         score += max(0, 25 - 100*dist)
@@ -328,22 +320,23 @@ def target_chat_id(update: Update = None):
     return last_chat_id
 
 def format_signal_msg(sig):
+    tag = MODE or "Relaxed"
     return (
-        f"🚀 <b>{sig['symbol']}</b> {sig['side']} (Intraday • Pro-Desk)\n"
+        f"🚀 <b>{sig['symbol']}</b> {sig['side']} (Intraday • {tag})\n"
         f"Entry: <b>{sig['entry']}</b>\n"
         f"TP1: <b>{sig['tp1']}</b> | TP2: <b>{sig['tp2']}</b>\n"
         f"SL: <b>{sig['sl']}</b>\n"
         f"ATR(5m): {sig['atr']} | Score: <b>{sig['score']}</b>/100\n"
-        f"Rules: breakout({BREAKOUT_LOOKBACK})/EMA20, vol≥{VOLUME_MULTIPLIER}×, RSI {RSI_MIN}-{RSI_MAX}, "
-        f"EMA50±{int(EMA_TOL_PCT*100)}%, 1h&4h EMA200, ADX≥{ADX_MIN}, BTC bias."
+        f"Rules: breakout({BREAKOUT_LOOKBACK})/EMA20, vol≥{VOLUME_MULTIPLIER}×, "
+        f"RSI {RSI_MIN}-{RSI_MAX}, EMA50±{int(EMA_TOL_PCT*100)}%."
     )
 
 # ------------------------------ commands -------------------------------------
 def cmd_start(update: Update, ctx: CallbackContext):
     ctx.bot.send_message(
         chat_id=target_chat_id(update),
-        text=("👋 InsiderSignals_Manual (Coinbase • Pro-Desk)\n"
-              "Auto-scans ALL USD/USDT with pro filters. Retries & keep-alive enabled.\n\n"
+        text=("👋 InsiderSignals_Manual (Coinbase • Relaxed)\n"
+              "Auto-scans USD/USDT pairs with looser gates for more signals.\n\n"
               "Commands:\n"
               "/ping – bot health\n"
               "/signals – recent signals (24h)\n"
@@ -354,8 +347,7 @@ def cmd_start(update: Update, ctx: CallbackContext):
 
 def cmd_ping(update: Update, ctx: CallbackContext):
     now = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
-    bias = { -1:"↓ risk-off", 0:"neutral", 1:"↑ risk-on" }.get(BTC_STATE["bias"], "neutral")
-    ctx.bot.send_message(chat_id=target_chat_id(update), text=f"✅ Bot alive: {now} {TIMEZONE} | BTC bias: {bias}")
+    ctx.bot.send_message(chat_id=target_chat_id(update), text=f"✅ Bot alive: {now} {TIMEZONE}")
 
 def cmd_signals(update: Update, ctx: CallbackContext):
     chat_id = target_chat_id(update)
@@ -407,13 +399,13 @@ def _scan_chunk(ctx: CallbackContext, push_to=None):
         if lt and (now - lt) < timedelta(minutes=SIGNAL_COOLDOWN_MIN): continue
         sig = intraday_signal(pid)
         if not sig:
-            time.sleep(0.06); continue
+            time.sleep(0.05); continue
         last_signal_time[pid] = now
         record = {"time": now, **sig}
         signals.append(record)
         ctx.bot.send_message(chat_id=chat_id, text=format_signal_msg(sig), parse_mode=ParseMode.HTML)
         hits += 1
-        time.sleep(0.12)  # gentle pacing for Telegram
+        time.sleep(0.1)
 
     if hits == 0 and push_to:
         ctx.bot.send_message(chat_id=push_to, text="(No valid setups this minute — still watching.)")
@@ -460,16 +452,13 @@ def main():
     dp.add_handler(CommandHandler("testsignal", cmd_testsignal))
 
     jq: JobQueue = updater.job_queue
-    # randomize the first run slightly so many instances don't sync-hit the API
-    jq.run_repeating(job_scan, interval=SCAN_INTERVAL_SECONDS, first=random.randint(8, 15))
+    jq.run_repeating(job_scan, interval=SCAN_INTERVAL_SECONDS, first=random.randint(6, 12))
     send_time = dtime(hour=DAILY_REPORT_HOUR, minute=0, tzinfo=tz)
     jq.run_daily(job_daily, time=send_time)
-
-    # keep-alive pinger (if URL provided)
     if KEEPALIVE_URL:
         jq.run_repeating(job_keepalive, interval=KEEPALIVE_SECONDS, first=5)
 
-    logging.info("InsiderSignals_Manual (Coinbase • Pro-Desk, robust) started.")
+    logging.info(f"InsiderSignals_Manual started (MODE={MODE or 'RELAXED'}).")
     updater.start_polling()
     updater.idle()
 
