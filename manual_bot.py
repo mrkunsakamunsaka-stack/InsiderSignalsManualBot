@@ -8,6 +8,11 @@ import pytz, requests, numpy as np
 from telegram import Update, ParseMode
 from telegram.ext import Updater, CommandHandler, CallbackContext, JobQueue
 
+# ========================
+# HARDCODED TELEGRAM TOKEN
+# ========================
+TELEGRAM_TOKEN = "8411524534:AAHppQZKZBNpSTvvX81s9RAUdlVTCTvaiVc"
+
 # ---------- keep-alive HTTP server (keeps Render Web Service running) ----------
 PORT = int(os.getenv("PORT", "10000"))
 class _Handler(http.server.SimpleHTTPRequestHandler):
@@ -19,8 +24,7 @@ def _keepalive():
 threading.Thread(target=_keepalive, daemon=True).start()
 # ------------------------------------------------------------------------------
 
-# -------------------- settings (override in Render Environment) ----------------
-TOKEN = os.getenv("TELEGRAM_MANUAL_TOKEN")
+# -------------------- settings (can still be overridden via env) ----------------
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Dublin")
 DAILY_REPORT_HOUR = int(os.getenv("DAILY_REPORT_HOUR", "20"))
 FORCED_CHAT_ID = os.getenv("CHAT_ID")  # optional numeric id
@@ -312,12 +316,9 @@ def job_daily(ctx: CallbackContext):
 
 # -------------------- main --------------------
 def main():
-    if not TOKEN:
-        raise RuntimeError("Missing TELEGRAM_MANUAL_TOKEN")
+    updater = Updater(TELEGRAM_TOKEN, use_context=True)
 
-    updater = Updater(TOKEN, use_context=True)
-
-    # *** important fix: clear webhook so polling won't conflict ***
+    # clear webhook to avoid polling conflicts
     updater.bot.delete_webhook(drop_pending_updates=True)
 
     dp = updater.dispatcher
