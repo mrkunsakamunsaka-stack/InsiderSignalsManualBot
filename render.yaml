@@ -6,12 +6,12 @@ services:
     autoDeploy: true
     dockerfilePath: ./Dockerfile
     envVars:
-      - key: 8411524534: AAHm2EYBRLmWKmUGAc5PJ5KH8 vXHPGqRjoM
-        fromSecret: TELEGRAM_MANUAL_TOKEN
+      - key: TELEGRAM_MANUAL_TOKEN
+        value: "8411524534:AAHm2EYBRLmWKmUGAc5PJ5KH8vXHPGqRjoM"
       - key: TIMEZONE
         value: Europe/Dublin
       - key: DAILY_REPORT_HOUR
         value: "20"
-      # Optional: set CHAT_ID to force where messages go (your user id or channel id)
+      # Optional: force a chat/channel
       # - key: CHAT_ID
       #   value: "123456789"
