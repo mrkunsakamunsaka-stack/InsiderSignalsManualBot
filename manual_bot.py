@@ -1,23 +1,21 @@
 # manual_bot.py — Coinbase • PAPER trading • €300 Sniper-Safe
-# v3.3 (2025-08-10)
-# - STRICT, SCORE≥97, Top-50 USD/USDT, 5% alloc, max 5 open
-# - Real-time paper engine (multi-partial TP, trailing SL, one recovery scale-in)
-# - 13 feature modules (ON by default), stats/journal
-# - 1h→4h resample fallback if native 4h is missing
-# - Token is read ONLY from env: TELEGRAM_MANUAL_TOKEN
+# v3.4 (2025-08-10)
+# - STRICT, SCORE≥97, Top-60 USD/USDT, chunked scan with priority & adaptive pacing
+# - Real-time paper engine (TP1 partial, trail to BE, gap-safe TP2), win/loss tracking
+# - Modules (all ON by default): EDGE, CORR, REGIME, COOLDOWN, SESSION
+# - Candle cache (few seconds), 1h→4h resample fallback, skip noisy g14400 pairs
+# - Telegram token ONLY from env: TELEGRAM_MANUAL_TOKEN
+# - Admin: /setflags, /setscore, /setmode, /scan, /positions, /paper, /pnl, /closed, /ping, /health
 
-import os, time, math, random, logging, json
+import os, time, math, random, logging, threading, json
 from datetime import datetime, timedelta, time as dtime
-
 import pytz, requests, numpy as np
 from telegram import Update, ParseMode
 from telegram.ext import Updater, CommandHandler, CallbackContext, JobQueue
 from requests.exceptions import RequestException
 from http.client import RemoteDisconnected
 
-START_TS = time.time()
-
-# ---------------- env & sniper defaults ----------------
+# --------- env ----------
 TOKEN = os.getenv("TELEGRAM_MANUAL_TOKEN")
 if not TOKEN:
     raise RuntimeError("Missing TELEGRAM_MANUAL_TOKEN in environment variables")
@@ -27,39 +25,46 @@ DAILY_REPORT_HOUR  = int(os.getenv("DAILY_REPORT_HOUR", "20"))
 FORCED_CHAT_ID     = os.getenv("CHAT_ID")
 tz = pytz.timezone(TIMEZONE)
 
-# cadence
+# cadence / universe
 SCAN_INTERVAL_SECONDS   = int(os.getenv("SCAN_INTERVAL_SECONDS", "30"))
-SYMBOLS_PER_SCAN        = int(os.getenv("SYMBOLS_PER_SCAN", "25"))
+SYMBOLS_PER_SCAN        = int(os.getenv("SYMBOLS_PER_SCAN", "20"))
 SIGNAL_COOLDOWN_MIN     = int(os.getenv("SIGNAL_COOLDOWN_MINUTES", "8"))
+MAX_PAIRS               = int(os.getenv("MAX_PAIRS", "60"))     # top liquid
 
-# universe cap (sniper mode = 50)
-MAX_PAIRS               = int(os.getenv("MAX_PAIRS", "50"))
-
-# mode & score (sniper = STRICT, 97)
+# mode & score
 SCORE_MIN               = int(os.getenv("SCORE_MIN", "97"))
 MODE                    = os.getenv("MODE", "STRICT").strip().upper()
 
 RELAXED = dict(BREAKOUT_LOOKBACK=3, VOLUME_MULTIPLIER=1.05, RSI_MIN=20, RSI_MAX=80,
                USE_EMA_CROSS=True,  EMA_TOL_PCT=0.012, USE_ADX_FILTER=True, ADX_MIN=10,
-               USE_HTF_FILTER=False, HTF_TOL_PCT=0.005, USE_BTC_BIAS=False)
+               USE_HTF_FILTER=False, HTF_TOL_PCT=0.005)
 STRICT  = dict(BREAKOUT_LOOKBACK=6, VOLUME_MULTIPLIER=1.20, RSI_MIN=35, RSI_MAX=65,
                USE_EMA_CROSS=True,  EMA_TOL_PCT=0.008, USE_ADX_FILTER=True, ADX_MIN=18,
-               USE_HTF_FILTER=True,  HTF_TOL_PCT=0.005, USE_BTC_BIAS=True)
+               USE_HTF_FILTER=True,  HTF_TOL_PCT=0.005)
 
 # exits (R = ATR 5m)
 R_TP1, R_TP2, R_SL      = float(os.getenv("R_TP1", "1.1")), float(os.getenv("R_TP2","2.2")), float(os.getenv("R_SL","1.1"))
 TRAIL_AFTER_TP1         = os.getenv("TRAIL_AFTER_TP1", "1") == "1"
 FEE_RATE                = float(os.getenv("FEE_RATE", "0.001"))     # 0.10%
 
-# paper sizing — sniper: 5% per trade, max 5
+# paper sizing
 POSITION_PCT            = float(os.getenv("POSITION_PCT", "0.05"))
-MAX_OPEN_TRADES         = int(os.getenv("MAX_OPEN_TRADES", "5"))
+MAX_OPEN_TRADES         = int(os.getenv("MAX_OPEN_TRADES", "10"))   # you asked 10
 MIN_USD_PER_TRADE       = float(os.getenv("MIN_USD_PER_TRADE", "10"))
 PAPER_START_CASH        = float(os.getenv("PAPER_START_CASH", "300"))
 PAPER_CHECK_SECONDS     = int(os.getenv("PAPER_CHECK_SECONDS", "15"))
 
-# historical validator (quick, ON)
-HIST_LOOKBACK_BARS_5M   = int(os.getenv("HIST_LOOKBACK_BARS_5M", "900"))  # ~75h
+# modules ON/OFF (1/0)
+FLAGS = {
+    "EDGE": int(os.getenv("EDGE", "1")),
+    "CORR": int(os.getenv("CORR", "1")),
+    "REGIME": int(os.getenv("REGIME", "1")),
+    "COOLDOWN": int(os.getenv("COOLDOWN", "1")),
+    "SESSION": int(os.getenv("SESSION", "1")),
+}
+
+# historical validator
+HIST_LOOKBACK_BARS_5M   = int(os.getenv("HIST_LOOKBACK_BARS_5M", "900"))
 HIST_MIN_OCCURRENCES    = int(os.getenv("HIST_MIN_OCCURRENCES", "10"))
 HIST_MIN_SUCCESS        = float(os.getenv("HIST_MIN_SUCCESS", "0.55"))
 
@@ -72,10 +77,6 @@ COOLDOWN_LOSSES         = int(os.getenv("COOLDOWN_LOSSES", "3"))
 COOLDOWN_WINDOW_MIN     = int(os.getenv("COOLDOWN_WINDOW_MIN", "120"))
 COOLDOWN_PAUSE_MIN      = int(os.getenv("COOLDOWN_PAUSE_MIN", "60"))
 
-# session hours (Dublin) to tighten a bit
-SESSION_QUIET_FROM      = int(os.getenv("SESSION_QUIET_FROM", "2"))
-SESSION_QUIET_TO        = int(os.getenv("SESSION_QUIET_TO", "5"))
-
 # retries / jitter
 RETRY_MAX               = int(os.getenv("RETRY_MAX", "4"))
 RETRY_BASE_DELAY        = float(os.getenv("RETRY_BASE_DELAY", "0.6"))
@@ -84,31 +85,30 @@ REQ_JITTER_MAX_MS       = int(os.getenv("REQ_JITTER_MAX_MS", "140"))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 
-# ---------------- Coinbase API ----------------
+# --------- Coinbase API ----------
 CB_BASE = "https://api.exchange.coinbase.com"
 GRAN_5M, GRAN_15M, GRAN_1H, GRAN_4H = 300, 900, 3600, 14400
 session = requests.Session()
-session.headers.update({"User-Agent": "insider-sniper/3.3"})
+session.headers.update({"User-Agent": "insider-sniper/3.4"})
 
-# ---------------- state & persistence ----------------
+# --------- state & persistence ----------
 CONFIG_PATH = "config.json"
 CONFIG = {
     "MODE": MODE, "SCORE_MIN": SCORE_MIN,
     "POSITION_PCT": POSITION_PCT, "MAX_OPEN_TRADES": MAX_OPEN_TRADES,
-    # feature flags (ON)
-    "EDGE": 1, "CORR": 1, "REGIME": 1, "COOLDOWN": 1, "FOCUS": 1,
-    "TRAIL": 1, "RECOVER": 1, "MTP": 1, "SENTI": 1, "SESSION": 1,
-    "ALERTS": 1
+    **FLAGS
 }
 signals = []
 last_signal_time = {}
 scan_cursor = 0
 watchlist = []
-NO_NATIVE_4H = set()
+NO_4H_NATIVE = set()
 last_chat_id = None
+
 BTC_STATE = {"adx1h": 0.0}
 ETH_STATE = {"adx1h": 0.0}
 STREAK = {"loss_times": [], "cooldown_until": 0}
+
 PAPER = {"cash": PAPER_START_CASH, "equity": PAPER_START_CASH,
          "positions": {}, "closed": [], "seq": 1,
          "realized_pnl": 0.0, "fees_paid": 0.0, "wins": 0, "losses": 0}
@@ -125,10 +125,11 @@ def _save_json(path, data):
         with open(path,"w") as f: json.dump(data,f)
     except Exception as e:
         logging.warning(f"save {path} error: {e}")
+
 def load_config():
     global CONFIG
-    data = _load_json(CONFIG_PATH, None)
-    if data: CONFIG.update(data)
+    d = _load_json(CONFIG_PATH, None)
+    if d: CONFIG.update(d)
 def save_config(): _save_json(CONFIG_PATH, CONFIG)
 load_config()
 
@@ -137,13 +138,14 @@ def apply_mode(m):
     globals().update(params); CONFIG["MODE"]=(m or "STRICT").upper()
 apply_mode(CONFIG["MODE"])
 
-# ---------------- indicators ----------------
+# --------- indicators ----------
 def ema(arr,p):
     arr=np.array(arr,float) if arr is not None else None
     if arr is None or len(arr)<p: return None
     a=2/(p+1); out=[arr[0]]
     for x in arr[1:]: out.append(a*x+(1-a)*out[-1])
     return np.array(out)
+
 def rsi(arr,p=14):
     arr=np.array(arr,float)
     if len(arr)<=p: return None
@@ -155,6 +157,7 @@ def rsi(arr,p=14):
     rs=np.where(np.array(al)==0,0,np.array(ag)/np.array(al))
     r=100-(100/(1+rs)); pad=len(arr)-len(r)-1
     return np.concatenate([np.full(pad,np.nan),r])
+
 def atr(h,l,c,p=14):
     h=np.array(h,float); l=np.array(l,float); c=np.array(c,float)
     if len(c)<=p: return None
@@ -165,6 +168,7 @@ def atr(h,l,c,p=14):
         a.append((a[-1]*(p-1)+tr[i])/p)
     pad=len(tr)-len(a)
     return np.concatenate([np.full(pad,np.nan),np.array(a)])
+
 def adx(h,l,c,p=14):
     h=np.array(h,float); l=np.array(l,float); c=np.array(c,float)
     if len(c)<=p+1: return None
@@ -181,7 +185,7 @@ def adx(h,l,c,p=14):
     pad=len(c)-len(adxv)-1
     return np.concatenate([np.full(pad,np.nan),adxv])
 
-# ---------------- HTTP helpers ----------------
+# --------- HTTP helpers ----------
 def _jitter(): time.sleep(random.randint(REQ_JITTER_MIN_MS, REQ_JITTER_MAX_MS)/1000.0)
 def _get(url, params=None, timeout=15):
     delay=RETRY_BASE_DELAY
@@ -189,13 +193,29 @@ def _get(url, params=None, timeout=15):
         try:
             r=session.get(url, params=params, timeout=timeout)
             if r.status_code in (429,502,503,504): raise RequestException(f"HTTP {r.status_code}")
+            if r.status_code==400:
+                # hard client error; don’t retry
+                r.raise_for_status()
             r.raise_for_status(); return r
         except (RequestException, RemoteDisconnected):
             if k==RETRY_MAX-1: raise
             time.sleep(delay*(1.6**k)+random.uniform(0.05,0.25))
 
-# ---------------- market data ----------------
-def get_pairs_top(limit=50):
+# --------- small candle cache (symbol+gran -> (ts,data)) ----------
+CANDLE_CACHE = {}  # key=(pid,gran), val=(expires_epoch,(o,h,l,c,v))
+CACHE_TTL = 3.0  # seconds
+
+def _cache_get(pid, gran):
+    key=(pid,gran); now=time.time()
+    v=CANDLE_CACHE.get(key)
+    if v and v[0]>now: return v[1]
+    return None
+
+def _cache_put(pid, gran, data):
+    CANDLE_CACHE[(pid,gran)] = (time.time()+CACHE_TTL, data)
+
+# --------- market data ----------
+def get_pairs_top(limit=60):
     try:
         r=_get(f"{CB_BASE}/products", timeout=25); products=r.json()
         rows=[]
@@ -214,20 +234,28 @@ def get_pairs_top(limit=50):
         return ["BTC-USD","ETH-USD","SOL-USD","XRP-USD","ADA-USD"]
 
 def cb_candles(pid, gran, limit=300):
+    if gran==GRAN_4H and pid in NO_4H_NATIVE:
+        return (None,)*5
+    cached=_cache_get(pid,gran)
+    if cached: return cached
     try:
         _jitter()
         r=_get(f"{CB_BASE}/products/{pid}/candles", params={"granularity": gran}, timeout=20)
         data=r.json()
-        if not isinstance(data,list) or not data: return (None,)*5
+        if not isinstance(data,list) or not data: 
+            return (None,)*5
         data.sort(key=lambda x:x[0])
-        # de-dupe timestamps
         clean=[]; last_t=0
         for d in data[-limit:]:
             if d[0]>last_t:
                 clean.append(d); last_t=d[0]
         t, low, high, op, close, vol = zip(*[(d[0],d[1],d[2],d[3],d[4],d[5]) for d in clean])
-        return list(op), list(high), list(low), list(close), list(vol)
+        out=(list(op), list(high), list(low), list(close), list(vol))
+        _cache_put(pid,gran,out)
+        return out
     except Exception as e:
+        if gran==GRAN_4H:
+            NO_4H_NATIVE.add(pid)  # stop noisy red logs
         logging.error(f"candles error {pid} g{gran}: {e}")
         return (None,)*5
 
@@ -251,7 +279,7 @@ def ticker(pid):
     except Exception:
         return float("nan")
 
-# ---------------- helpers ----------------
+# --------- helpers ----------
 def r_targets(entry, atr5, side):
     if side=="LONG":
         sl= entry - R_SL*atr5
@@ -272,8 +300,11 @@ def illiquid(h5,l5,c5):
     rng=(max(h5[-24:])-min(l5[-24:]))/max(1e-9,c5[-1])
     return rng<0.0005
 
-# ---------------- regime/sentiment stubs ----------------
+# --------- regime / session ----------
 def _update_regime():
+    if not FLAGS.get("REGIME",1): 
+        BTC_STATE["adx1h"]=ETH_STATE["adx1h"]=25.0
+        return
     o1,h1,l1,c1,v1 = cb_candles("BTC-USD", GRAN_1H, 220)
     if c1:
         a=adx(h1,l1,c1,14)
@@ -283,28 +314,16 @@ def _update_regime():
         a=adx(h1e,l1e,c1e,14)
         if a is not None and not math.isnan(a[-1]): ETH_STATE["adx1h"]=float(a[-1])
 
-def _market_breadth():
-    syms=_ensure_universe()
-    good=0; total=0
-    for pid in syms[:40]:
-        o1,h1,l1,c1,v1=cb_candles(pid,GRAN_1H,120)
-        if not c1: continue
-        e50=ema(c1,50)
-        if e50 is None: continue
-        total+=1
-        if c1[-1]>e50[-1]: good+=1
-    return (good/total) if total else 0.5
+def _session_quiet_now():
+    if not FLAGS.get("SESSION",1): return False
+    qf = int(os.getenv("SESSION_QUIET_FROM","2"))
+    qt = int(os.getenv("SESSION_QUIET_TO","5"))
+    h = datetime.now(tz).hour
+    return (qf <= h <= qt) if qf <= qt else not (qt < h < qf)
 
-def _news_block():
-    # conservative placeholder: block when BTC 5m move > ±1.2%
-    o5,h5,l5,c5,v5=cb_candles("BTC-USD",GRAN_5M,10)
-    if not c5 or len(c5)<2: return False
-    chg=(c5[-1]-c5[-2])/max(1e-9,c5[-2])
-    return abs(chg)>=0.012
-
-# ---------------- historical quick validator ----------------
+# --------- historical quick validator ----------
 def hist_profitable(pid, o5,h5,l5,c5,v5):
-    if not CONFIG.get("EDGE",1): return True
+    if not FLAGS.get("EDGE",1): return True
     try:
         if not c5 or len(c5)<200:
             return True
@@ -332,9 +351,9 @@ def hist_profitable(pid, o5,h5,l5,c5,v5):
         logging.warning(f"hist validator error {pid}: {e}")
         return True
 
-# ---------------- correlation control ----------------
-def _corr_block(pid, open_symbols):
-    if not CONFIG.get("CORR",1) or not open_symbols: return 1.0
+# --------- correlation control ----------
+def corr_multiplier(pid, open_symbols):
+    if not FLAGS.get("CORR",1) or not open_symbols: return 1.0
     try:
         o1,h1,l1,c1,v1=cb_candles(pid,GRAN_1H,120)
         if not c1: return 1.0
@@ -353,39 +372,24 @@ def _corr_block(pid, open_symbols):
     except Exception:
         return 1.0
 
-# ---------------- streak guard ----------------
-def _cooldown_active():
-    if not CONFIG.get("COOLDOWN",1): return False
+# --------- streak guard ----------
+def cooldown_active():
+    if not FLAGS.get("COOLDOWN",1): return False
     return time.time() < STREAK.get("cooldown_until", 0)
 
-# ---------------- universe focus ----------------
-def focus_universe(base):
-    if not CONFIG.get("FOCUS",1): return base
-    vol_rank=[]; mom_rank=[]
-    try:
-        r=_get(f"{CB_BASE}/products", timeout=20); pro=r.json()
-        for p in pro:
-            if p.get("status")!="online" or p.get("trading_disabled"): continue
-            if (p.get("quote_currency") or "").upper() not in ("USD","USDT"): continue
-            vol=float(p.get("volume_24h") or 0.0); vol_rank.append((vol,p["id"]))
-        vol_rank.sort(reverse=True); top_vol=[pid for _,pid in vol_rank[:40]]
-    except Exception:
-        top_vol=base[:40]
-    for pid in base[:80]:
-        o1,h1,l1,c1,v1=cb_candles(pid,GRAN_1H,30)
-        if not c1 or len(c1)<2: continue
-        ret=(c1[-1]-c1[-2])/max(1e-9,c1[-2])
-        mom_rank.append((ret,pid))
-    mom_rank.sort(reverse=True); top_mom=[pid for _,pid in mom_rank[:20]]
-    seen=set(); out=[]
-    for pid in top_vol+top_mom:
-        if pid not in seen:
-            out.append(pid); seen.add(pid)
-        if len(out)>=MAX_PAIRS: break
-    return out or base
+def add_result_winloss(pnl_usd):
+    if pnl_usd >= 0:
+        PAPER["wins"] += 1
+    else:
+        PAPER["losses"] += 1
+        now = time.time()
+        STREAK["loss_times"] = [t for t in STREAK["loss_times"] if now - t < COOLDOWN_WINDOW_MIN*60]
+        STREAK["loss_times"].append(now)
+        if len(STREAK["loss_times"]) >= COOLDOWN_LOSSES:
+            STREAK["cooldown_until"] = now + COOLDOWN_PAUSE_MIN*60
 
-# ---------------- scoring & signal ----------------
-def score_signal(price, ema50_now, atr5, vol_ok, rsi_val, adx_val):
+# --------- scoring & signal ----------
+def score_signal(price, ema50_now, a5, vol_ok, rsi_val, adx_val):
     s=0
     if vol_ok: s+=25
     if adx_val is not None and not math.isnan(adx_val): s+=min(25,max(0,(adx_val-10)*2))
@@ -393,13 +397,14 @@ def score_signal(price, ema50_now, atr5, vol_ok, rsi_val, adx_val):
         dist=abs(price-ema50_now)/ema50_now
         s+=max(0,25-100*dist)
     if rsi_val is not None and not math.isnan(rsi_val): s+=max(0,25-abs(50-rsi_val))
-    return int(min(100,s))
+    # regime/session nudges
+    if FLAGS.get("REGIME",1):
+        if BTC_STATE["adx1h"] < 18 and ETH_STATE["adx1h"] < 18: s -= 2
+    if FLAGS.get("SESSION",1) and _session_quiet_now(): s -= 2
+    return int(min(100,max(0,s)))
 
 def build_signal(pid):
-    if _cooldown_active(): return None
-    if _news_block(): return None
-    # sentiment
-    if CONFIG.get("SENTI",1) and _market_breadth() < 0.45: return None
+    if cooldown_active(): return None
 
     o5,h5,l5,c5,v5 = cb_candles(pid,GRAN_5M,240)
     if not c5 or illiquid(h5,l5,c5): return None
@@ -409,12 +414,11 @@ def build_signal(pid):
     o1,h1,l1,c1,v1      = cb_candles(pid,GRAN_1H,220)
 
     c4h=None
-    if USE_HTF_FILTER and pid not in NO_NATIVE_4H:
+    if USE_HTF_FILTER:
         o4h,h4h,l4h,c4h,v4h = cb_candles(pid,GRAN_4H,220)
-        if not c4h: NO_NATIVE_4H.add(pid)
-    if USE_HTF_FILTER and c4h is None and c1:
-        _o,_h,_l,_c,_v = resample_1h_to_4h(o1,h1,l1,c1,v1)
-        c4h = _c
+        if not c4h and c1:
+            _o,_h,_l,_c,_v = resample_1h_to_4h(o1,h1,l1,c1,v1)
+            c4h=_c
 
     ema50_1h=ema(c1,50) if c1 else None
     ema200_1h=ema(c1,200) if c1 else None
@@ -454,20 +458,8 @@ def build_signal(pid):
     ok = long_trig and vol_ok and r_ok and trend_up and htf_up and adx_ok
     if not ok: return None
 
+    _update_regime()
     sc = score_signal(last, ema50_now, a5, vol_ok, r[-1], adx1h[-1] if adx1h is not None else None)
-
-    if CONFIG.get("REGIME",1):
-        _update_regime()
-        if BTC_STATE["adx1h"] < 18 and ETH_STATE["adx1h"] < 18:
-            sc -= 2
-
-    # session tightening
-    now_hour = datetime.now(tz).hour
-    qf, qt = SESSION_QUIET_FROM, SESSION_QUIET_TO
-    quiet = (qf <= now_hour <= qt) if qf <= qt else not (qt < now_hour < qf)
-    if CONFIG.get("SESSION",1) and quiet:
-        sc -= 2
-
     if sc < CONFIG["SCORE_MIN"]: return None
 
     sl,tp1,tp2 = r_targets(last,a5,"LONG")
@@ -475,35 +467,35 @@ def build_signal(pid):
             "tp1": round(tp1,6), "tp2": round(tp2,6), "sl": round(sl,6),
             "atr": round(a5,6), "score": sc}
 
-# ---------------- telegram helpers ----------------
+# --------- telegram helpers ----------
 def target_chat_id(update: Update=None):
     global last_chat_id
     if FORCED_CHAT_ID: return int(FORCED_CHAT_ID)
     if update: last_chat_id = update.effective_chat.id
     return last_chat_id
 
-def _alert(ctx: CallbackContext, msg: str):
-    if not CONFIG.get("ALERTS",1): return
-    chat_id = target_chat_id()
-    if chat_id:
-        ctx.bot.send_message(chat_id=chat_id, text=msg, parse_mode=ParseMode.HTML)
-
 def fmt(sig):
     return (f"🚀 <b>{sig['symbol']}</b> LONG (Intraday • {CONFIG['MODE']})\n"
             f"Entry: <b>{sig['entry']}</b>\nTP1: <b>{sig['tp1']}</b> | TP2: <b>{sig['tp2']}</b>\n"
             f"SL: <b>{sig['sl']}</b>\nATR(5m): {sig['atr']} | Score: <b>{sig['score']}</b>/100")
 
-# ---------------- paper engine ----------------
-def _can_open_more(): return len(PAPER["positions"]) < CONFIG["MAX_OPEN_TRADES"]
-def _free_usd(): return float(PAPER["cash"])
+# --------- paper engine ----------
+def can_open_more(): return len(PAPER["positions"]) < CONFIG["MAX_OPEN_TRADES"]
+def free_usd(): return float(PAPER["cash"])
 
-def _execute_long(sig, ctx: CallbackContext, chat_id):
-    if not _can_open_more():
+def exec_long(sig, ctx: CallbackContext, chat_id):
+    if not can_open_more():
         ctx.bot.send_message(chat_id=chat_id, text="⚪ Skipped: reached MAX_OPEN_TRADES"); return
-    free = _free_usd()
-    alloc = max(MIN_USD_PER_TRADE, free * float(CONFIG["POSITION_PCT"]))
-    if free < MIN_USD_PER_TRADE:
+    bal = free_usd()
+    base_alloc = max(MIN_USD_PER_TRADE, bal * float(CONFIG["POSITION_PCT"]))
+    if bal < MIN_USD_PER_TRADE:
         ctx.bot.send_message(chat_id=chat_id, text="⚪ Skipped: insufficient USD balance"); return
+
+    # correlation sizing
+    alloc_mult = corr_multiplier(sig["symbol"], [PAPER["positions"][i]["symbol"] for i in PAPER["positions"]])
+    if alloc_mult == 0.0:
+        ctx.bot.send_message(chat_id=chat_id, text=f"⚪ Skipped: highly correlated with open positions"); return
+    alloc = base_alloc * alloc_mult
 
     entry = sig["entry"]
     qty = (alloc * (1 - FEE_RATE)) / entry
@@ -525,14 +517,14 @@ def _execute_long(sig, ctx: CallbackContext, chat_id):
     _save_json("paper.json", PAPER)
     ctx.bot.send_message(chat_id=chat_id, text=f"🟢 PAPER BUY {sig['symbol']} ${alloc:.2f} | entry {entry} | qty {qty:.6f}")
 
-def _paper_check_exits(ctx: CallbackContext):
+def paper_check_exits(ctx: CallbackContext):
     if not PAPER["positions"]: return
     to_remove=[]
     for pid, p in list(PAPER["positions"].items()):
         cur = ticker(p["symbol"])
         if not np.isfinite(cur): continue
 
-        # TP2 — full close
+        # TP2 dominates
         if cur >= p["tp2"]:
             exit_price = p["tp2"]
             proceeds = exit_price * p["qty_total"]
@@ -544,10 +536,7 @@ def _paper_check_exits(ctx: CallbackContext):
             pnl_usd = gross - total_fees
             pnl_pct = (exit_price - p["entry_avg"]) / p["entry_avg"] * 100 if p["entry_avg"] else 0
             PAPER["realized_pnl"] += pnl_usd
-            if pnl_usd >= 0:
-                PAPER["wins"] += 1
-            else:
-                PAPER["losses"] += 1
+            add_result_winloss(pnl_usd)
             PAPER["closed"].append({
                 "id": pid, "symbol": p["symbol"], "entry_avg": p["entry_avg"],
                 "exit_avg": exit_price, "qty_total": p["qty_total"],
@@ -555,10 +544,9 @@ def _paper_check_exits(ctx: CallbackContext):
                 "reason": "TP2", "closed_at": datetime.now(tz).isoformat()
             })
             to_remove.append(pid)
-            _alert(ctx, f"🎯 <b>TP2 hit</b> {p['symbol']} @ {exit_price:.6f} | PnL ${pnl_usd:.2f} ({pnl_pct:.2f}%)")
+            ctx.bot.send_message(chat_id=target_chat_id(), text=f"🎯 <b>TP2 hit</b> {p['symbol']} @ {exit_price:.6f} | PnL ${pnl_usd:.2f} ({pnl_pct:.2f}%)", parse_mode=ParseMode.HTML)
             continue
 
-        # TP1 partial once + trail to BE
         if (not p["tp1_done"]) and cur >= p["tp1"]:
             exit_value = p["tp1"] * p["qty_tp1"]
             fee_close = exit_value * FEE_RATE
@@ -567,12 +555,11 @@ def _paper_check_exits(ctx: CallbackContext):
             p["fees_close_total"] += fee_close
             p["tp1_done"] = True
             if TRAIL_AFTER_TP1: p["sl_dyn"] = max(p["sl_dyn"], p["entry_avg"])
-            _alert(ctx, f"🥳 <b>TP1 partial</b> {p['symbol']} sold {p['qty_tp1']:.6f} @ {p['tp1']:.6f}")
+            ctx.bot.send_message(chat_id=target_chat_id(), text=f"🥳 <b>TP1 partial</b> {p['symbol']} sold {p['qty_tp1']:.6f} @ {p['tp1']:.6f}", parse_mode=ParseMode.HTML)
 
-        # SL on runner
         exit_reason=None; exit_price=None
         if cur <= p["sl_dyn"]:
-            exit_reason="SL"; exit_price=p["sl_dyn"]
+            exit_reason, exit_price = "SL", p["sl_dyn"]
 
         if exit_price is not None:
             runner_val = exit_price * p["qty_runner"]
@@ -586,10 +573,7 @@ def _paper_check_exits(ctx: CallbackContext):
             pnl_usd = gross - total_fees
             pnl_pct = (avg_exit - p["entry_avg"]) / p["entry_avg"] * 100 if p["entry_avg"] else 0
             PAPER["realized_pnl"] += pnl_usd
-            if pnl_usd >= 0:
-                PAPER["wins"] += 1
-            else:
-                PAPER["losses"] += 1
+            add_result_winloss(pnl_usd)
             PAPER["closed"].append({
                 "id": pid, "symbol": p["symbol"], "entry_avg": p["entry_avg"],
                 "exit_avg": avg_exit, "qty_total": p["qty_total"],
@@ -597,13 +581,13 @@ def _paper_check_exits(ctx: CallbackContext):
                 "reason": exit_reason, "closed_at": datetime.now(tz).isoformat()
             })
             to_remove.append(pid)
-            _alert(ctx, f"🛑 <b>{exit_reason}</b> {p['symbol']} avg exit {avg_exit:.6f} | PnL ${pnl_usd:.2f} ({pnl_pct:.2f}%)")
+            ctx.bot.send_message(chat_id=target_chat_id(), text=f"🛑 <b>{exit_reason}</b> {p['symbol']} avg exit {avg_exit:.6f} | PnL ${pnl_usd:.2f} ({pnl_pct:.2f}%)", parse_mode=ParseMode.HTML)
 
     for pid in to_remove:
         PAPER["positions"].pop(pid, None)
     if to_remove: _save_json("paper.json", PAPER)
 
-def _mark_equity():
+def update_equity_mark():
     eq = PAPER["cash"]
     for p in PAPER["positions"].values():
         cur = ticker(p["symbol"])
@@ -613,74 +597,120 @@ def _mark_equity():
     PAPER["equity"] = eq
     _save_json("paper.json", PAPER)
 
-# ---------------- universe & scan ----------------
-def _ensure_universe():
+# --------- scan engine (priority + adaptive) ----------
+scan_lock = threading.Lock()
+chunk_size = SYMBOLS_PER_SCAN
+last_chunk_hits = 0
+
+def ensure_universe():
     global watchlist
     if not watchlist:
-        watchlist = get_pairs_top(limit=MAX_PAIRS)
-        watchlist = focus_universe(watchlist)
-        logging.info(f"Watchlist size: {len(watchlist)}")
+        base = get_pairs_top(limit=max(60, MAX_PAIRS))
+        # momentum priority (last 1h return)
+        mom=[]
+        for pid in base[:80]:
+            o1,h1,l1,c1,v1=cb_candles(pid,GRAN_1H,30)
+            if not c1 or len(c1)<2: continue
+            ret=(c1[-1]-c1[-2])/max(1e-9,c1[-2])
+            mom.append((ret,pid))
+        mom.sort(reverse=True)
+        merged=[]
+        seen=set()
+        for _,pid in mom + [(0,p) for p in base]:
+            if pid not in seen:
+                merged.append(pid); seen.add(pid)
+            if len(merged)>=MAX_PAIRS: break
+        watchlist = merged or base
+        logging.info(f"Watchlist prepared: {len(watchlist)} symbols")
     return watchlist
 
-def _scan_chunk(ctx: CallbackContext, push_to=None):
-    global scan_cursor
-    chat_id = push_to or target_chat_id()
-    syms = _ensure_universe()
-    if not syms or not chat_id: return
+def scan_chunk(ctx: CallbackContext, push_to=None):
+    global scan_cursor, last_chunk_hits, chunk_size
+    if not scan_lock.acquire(blocking=False):
+        return  # previous scan still running
+    try:
+        chat_id = push_to or target_chat_id()
+        now = datetime.now(tz)
+        syms = ensure_universe()
+        if not syms: return
 
-    now = datetime.now(tz)
-    start = scan_cursor; end = min(start + SYMBOLS_PER_SCAN, len(syms))
-    chunk = syms[start:end]; scan_cursor = 0 if end >= len(syms) else end
+        start = scan_cursor; end = min(start + chunk_size, len(syms))
+        chunk = syms[start:end]; scan_cursor = 0 if end >= len(syms) else end
 
-    hits = 0
-    open_symbols = [p["symbol"] for p in PAPER["positions"].values()]
-    for pid in chunk:
-        lt = last_signal_time.get(pid)
-        if lt and (now - lt) < timedelta(minutes=SIGNAL_COOLDOWN_MIN): continue
+        hits = 0
+        _update_regime()
 
-        # correlation throttling
-        corr_factor = _corr_block(pid, open_symbols)
-        if corr_factor == 0.0: continue
+        for pid in chunk:
+            lt = last_signal_time.get(pid)
+            if lt and (now - lt) < timedelta(minutes=SIGNAL_COOLDOWN_MIN): 
+                continue
 
-        sig = build_signal(pid)
-        if not sig or sig.get("score", 0) < CONFIG["SCORE_MIN"]:
-            time.sleep(0.05); continue
+            sig = build_signal(pid)
+            if not sig or sig.get("score", 0) < CONFIG["SCORE_MIN"]:
+                time.sleep(0.03); continue
 
-        last_signal_time[pid] = now
-        signals.append({"time": now, **sig})
-        ctx.bot.send_message(chat_id=chat_id, text=fmt(sig), parse_mode=ParseMode.HTML)
+            last_signal_time[pid] = now
+            signals.append({"time": now, **sig})
+            if chat_id:
+                ctx.bot.send_message(chat_id=chat_id, text=fmt(sig), parse_mode=ParseMode.HTML)
+            exec_long(sig, ctx, chat_id)
+            hits += 1
+            time.sleep(0.08)
 
-        # size with correlation factor
-        base_pct = float(CONFIG["POSITION_PCT"])
-        CONFIG["POSITION_PCT"] = base_pct * corr_factor
-        _execute_long(sig, ctx, chat_id)
-        CONFIG["POSITION_PCT"] = base_pct
+        # adaptive pacing: if no hits across chunk, slightly shrink next chunk; if ≥2 hits, grow a bit
+        last_chunk_hits = hits
+        if hits == 0 and chunk_size > 12:
+            chunk_size -= 1
+        elif hits >= 2 and chunk_size < 30:
+            chunk_size += 1
 
-        hits += 1; time.sleep(0.1)
+    finally:
+        scan_lock.release()
 
-    if hits == 0 and push_to:
-        ctx.bot.send_message(chat_id=push_to, text=f"(No valid setups ≥ {CONFIG['SCORE_MIN']} this minute — still watching.)")
+# --------- jobs ----------
+def job_scan(ctx: CallbackContext): scan_chunk(ctx)
+def job_paper(ctx: CallbackContext):
+    paper_check_exits(ctx); update_equity_mark()
 
-# ---------------- commands ----------------
+def job_daily(ctx: CallbackContext):
+    chat_id = target_chat_id()
+    if not chat_id: return
+    cutoff = datetime.now(tz) - timedelta(days=1)
+    recent = [s for s in signals if s["time"] >= cutoff and s.get("score", 0) >= CONFIG["SCORE_MIN"]]
+    msg = ("📊 Daily Report (24h): No signals." if not recent else
+           "📊 <b>Daily Report</b>\n" + "\n".join(
+               f"• {s['time'].strftime('%H:%M')} {s['symbol']} {s['side']} @ {s['entry']} | TP1 {s['tp1']} | TP2 {s['tp2']} | SL {s['sl']} | Score {s.get('score','-')}"
+               for s in recent))
+    ctx.bot.send_message(chat_id=chat_id, text=msg, parse_mode=ParseMode.HTML)
+
+# --------- commands ----------
 def cmd_start(update: Update, ctx: CallbackContext):
     ctx.bot.send_message(chat_id=target_chat_id(update), parse_mode=ParseMode.HTML, text=(
-        "👋 InsiderSignals_Manual (Coinbase • PAPER)\n"
+        "👋 InsiderSignals_Manual\n"
         f"Mode: <b>{CONFIG['MODE']}</b> | SCORE_MIN <b>{CONFIG['SCORE_MIN']}</b>\n"
         f"Max open: <b>{CONFIG['MAX_OPEN_TRADES']}</b> | Alloc: <b>{int(CONFIG['POSITION_PCT']*100)}%</b>\n"
-        f"Paper cash: ${PAPER['cash']:.2f} | Alerts: <b>{'ON' if CONFIG.get('ALERTS',1) else 'OFF'}</b>\n\n"
+        f"Flags: EDGE={FLAGS['EDGE']} CORR={FLAGS['CORR']} REGIME={FLAGS['REGIME']} COOLDOWN={FLAGS['COOLDOWN']} SESSION={FLAGS['SESSION']}\n"
+        f"Paper cash: ${PAPER['cash']:.2f}\n\n"
         "Commands:\n"
-        "/paper /positions /closed /pnl /paperreset /setpaper N\n"
-        "/setmax N /setalloc P /setscore S /setmode RELAXED|STRICT\n"
-        "/alertson /alertsoff /scan"
+        "/paper /positions /closed /pnl\n"
+        "/setscore S /setmode RELAXED|STRICT /setflags EDGE|CORR|REGIME|COOLDOWN|SESSION 0|1\n"
+        "/scan /ping /health"
     ))
 
 def cmd_paper(update: Update, ctx: CallbackContext):
-    _mark_equity()
+    update_equity_mark()
     realized = PAPER["realized_pnl"]; fees = PAPER["fees_paid"]
     ctx.bot.send_message(chat_id=target_chat_id(update), parse_mode=ParseMode.HTML,
-        text=(f"💼 <b>Paper Account</b>\nCash: ${PAPER['cash']:.2f}\nEquity: ${PAPER['equity']:.2f}\n"
+        text=(f"💼 <b>Paper</b>\nCash: ${PAPER['cash']:.2f}\nEquity: ${PAPER['equity']:.2f}\n"
               f"Open: {len(PAPER['positions'])} | Closed: {len(PAPER['closed'])}\n"
-              f"Realized PnL: ${realized:.2f} | Fees paid: ${fees:.2f}"))
+              f"Realized PnL: ${realized:.2f} | Fees: ${fees:.2f}"))
+
+def cmd_pnl(update: Update, ctx: CallbackContext):
+    wins = PAPER["wins"]; losses = PAPER["losses"]; total = wins + losses
+    wr = (wins/total*100) if total else 0
+    ctx.bot.send_message(chat_id=target_chat_id(update), parse_mode=ParseMode.HTML,
+        text=(f"📈 <b>PnL</b>\nRealized: ${PAPER['realized_pnl']:.2f}\n"
+              f"Fees: ${PAPER['fees_paid']:.2f}\nWins: {wins} | Losses: {losses} | Win rate: {wr:.1f}%"))
 
 def cmd_positions(update: Update, ctx: CallbackContext):
     if not PAPER["positions"]:
@@ -710,46 +740,6 @@ def cmd_closed(update: Update, ctx: CallbackContext):
                      f"Qty {t['qty_total']:.6f} | PnL ${t['pnl_usd']:.2f} ({t['pnl_pct']:.2f}%) [{t['reason']}]")
     ctx.bot.send_message(chat_id=target_chat_id(update), text="\n".join(lines), parse_mode=ParseMode.HTML)
 
-def cmd_pnl(update: Update, ctx: CallbackContext):
-    wins = PAPER["wins"]; losses = PAPER["losses"]; total = wins + losses
-    wr = (wins/total*100) if total else 0
-    ctx.bot.send_message(chat_id=target_chat_id(update), parse_mode=ParseMode.HTML,
-        text=(f"📈 <b>PnL Totals</b>\nRealized: ${PAPER['realized_pnl']:.2f}\n"
-              f"Fees: ${PAPER['fees_paid']:.2f}\nWins: {wins} | Losses: {losses} | Win rate: {wr:.1f}%"))
-
-def cmd_paperreset(update: Update, ctx: CallbackContext):
-    PAPER.update({"cash": PAPER_START_CASH, "equity": PAPER_START_CASH,
-                  "positions": {}, "closed": [], "seq": 1,
-                  "realized_pnl": 0.0, "fees_paid": 0.0, "wins": 0, "losses": 0})
-    _save_json("paper.json", PAPER)
-    ctx.bot.send_message(chat_id=target_chat_id(update), text=f"🧹 Paper reset to ${PAPER_START_CASH:.2f}.")
-
-def cmd_setpaper(update: Update, ctx: CallbackContext):
-    try:
-        n = float(update.message.text.split()[1]); assert n > 0
-        PAPER.update({"cash": n, "equity": n, "positions": {}, "closed": [], "seq": 1,
-                      "realized_pnl": 0.0, "fees_paid": 0.0, "wins": 0, "losses": 0})
-        _save_json("paper.json", PAPER)
-        ctx.bot.send_message(chat_id=target_chat_id(update), text=f"✅ Paper start cash set to ${n:.2f} (reset).")
-    except Exception:
-        ctx.bot.send_message(chat_id=target_chat_id(update), text="Usage: /setpaper <amount>")
-
-def cmd_setmax(update: Update, ctx: CallbackContext):
-    try:
-        n = int(update.message.text.split()[1]); assert 1 <= n <= 20
-        CONFIG["MAX_OPEN_TRADES"] = n; save_config()
-        ctx.bot.send_message(chat_id=target_chat_id(update), text=f"✅ MAX_OPEN_TRADES set to {n}.")
-    except Exception:
-        ctx.bot.send_message(chat_id=target_chat_id(update), text="Usage: /setmax 1..20")
-
-def cmd_setalloc(update: Update, ctx: CallbackContext):
-    try:
-        p = float(update.message.text.split()[1]); assert 1 <= p <= 100
-        CONFIG["POSITION_PCT"] = p/100.0; save_config()
-        ctx.bot.send_message(chat_id=target_chat_id(update), text=f"✅ POSITION_PCT set to {p}%.")
-    except Exception:
-        ctx.bot.send_message(chat_id=target_chat_id(update), text="Usage: /setalloc 1..100")
-
 def cmd_setscore(update: Update, ctx: CallbackContext):
     try:
         s = int(update.message.text.split()[1]); assert 1 <= s <= 100
@@ -766,35 +756,28 @@ def cmd_setmode(update: Update, ctx: CallbackContext):
     except Exception:
         ctx.bot.send_message(chat_id=target_chat_id(update), text="Usage: /setmode RELAXED|STRICT")
 
-def cmd_alertson(update: Update, ctx: CallbackContext):
-    CONFIG["ALERTS"]=1; save_config()
-    ctx.bot.send_message(chat_id=target_chat_id(update), text="🔔 Alerts ON.")
-
-def cmd_alertsoff(update: Update, ctx: CallbackContext):
-    CONFIG["ALERTS"]=0; save_config()
-    ctx.bot.send_message(chat_id=target_chat_id(update), text="🔕 Alerts OFF.")
+def cmd_setflags(update: Update, ctx: CallbackContext):
+    try:
+        k, val = update.message.text.split()[1].upper(), int(update.message.text.split()[2])
+        assert k in FLAGS and val in (0,1)
+        FLAGS[k] = val; CONFIG[k]=val; save_config()
+        ctx.bot.send_message(chat_id=target_chat_id(update), text=f"✅ {k} set to {val}.")
+    except Exception:
+        ctx.bot.send_message(chat_id=target_chat_id(update), text="Usage: /setflags EDGE|CORR|REGIME|COOLDOWN|SESSION 0|1")
 
 def cmd_scan(update: Update, ctx: CallbackContext):
     ctx.bot.send_message(chat_id=target_chat_id(update), text=f"🔍 Scan running (mode={CONFIG['MODE']}, score≥{CONFIG['SCORE_MIN']})…")
-    _scan_chunk(ctx, push_to=target_chat_id(update))
+    scan_chunk(ctx, push_to=target_chat_id(update))
 
-# ---------------- daily & paper jobs ----------------
-def job_daily(ctx: CallbackContext):
-    chat_id = target_chat_id()
-    if not chat_id: return
-    cutoff = datetime.now(tz) - timedelta(days=1)
-    recent = [s for s in signals if s["time"] >= cutoff and s.get("score", 0) >= CONFIG["SCORE_MIN"]]
-    msg = ("📊 Daily Report (24h): No signals." if not recent else
-           "📊 <b>Daily Report</b>\n" + "\n".join(
-               f"• {s['time'].strftime('%H:%M')} {s['symbol']} {s['side']} @ {s['entry']} | TP1 {s['tp1']} | TP2 {s['tp2']} | SL {s['sl']} | Score {s.get('score','-')}"
-               for s in recent))
-    ctx.bot.send_message(chat_id=chat_id, text=msg, parse_mode=ParseMode.HTML)
+def cmd_ping(update: Update, ctx: CallbackContext):
+    ctx.bot.send_message(chat_id=target_chat_id(update), text="pong")
 
-def job_paper(ctx: CallbackContext):
-    _paper_check_exits(ctx)
-    _mark_equity()
+def cmd_health(update: Update, ctx: CallbackContext):
+    _update_regime()
+    ctx.bot.send_message(chat_id=target_chat_id(update),
+                         text=f"OK | BTC_ADX1h {BTC_STATE['adx1h']:.1f} | ETH_ADX1h {ETH_STATE['adx1h']:.1f} | quiet={_session_quiet_now()} | chunk={chunk_size}")
 
-# ---------------- main ----------------
+# --------- main ----------
 def main():
     updater = Updater(TOKEN, use_context=True)
     updater.bot.delete_webhook(drop_pending_updates=True)
@@ -805,22 +788,20 @@ def main():
     dp.add_handler(CommandHandler("pnl", cmd_pnl))
     dp.add_handler(CommandHandler("positions", cmd_positions))
     dp.add_handler(CommandHandler("closed", cmd_closed))
-    dp.add_handler(CommandHandler("paperreset", cmd_paperreset))
-    dp.add_handler(CommandHandler("setpaper", cmd_setpaper))
-    dp.add_handler(CommandHandler("setmax", cmd_setmax))
-    dp.add_handler(CommandHandler("setalloc", cmd_setalloc))
     dp.add_handler(CommandHandler("setscore", cmd_setscore))
     dp.add_handler(CommandHandler("setmode", cmd_setmode))
-    dp.add_handler(CommandHandler("alertson", cmd_alertson))
-    dp.add_handler(CommandHandler("alertsoff", cmd_alertsoff))
+    dp.add_handler(CommandHandler("setflags", cmd_setflags))
     dp.add_handler(CommandHandler("scan", cmd_scan))
+    dp.add_handler(CommandHandler("ping", cmd_ping))
+    dp.add_handler(CommandHandler("health", cmd_health))
 
     jq: JobQueue = updater.job_queue
-    jq.run_repeating(lambda c: _scan_chunk(c), interval=SCAN_INTERVAL_SECONDS, first=random.randint(6, 12))
-    jq.run_repeating(job_paper, interval=PAPER_CHECK_SECONDS, first=8)
+    # Single jobs; guard inside prevents overlap:
+    jq.run_repeating(job_scan, interval=SCAN_INTERVAL_SECONDS, first=random.randint(6,12), name="job_scan")
+    jq.run_repeating(job_paper, interval=PAPER_CHECK_SECONDS, first=8, name="job_paper")
     jq.run_daily(job_daily, time=dtime(hour=DAILY_REPORT_HOUR, minute=0, tzinfo=tz))
 
-    logging.info(f"InsiderSignals_Manual started. SCORE_MIN={CONFIG['SCORE_MIN']} MODE={CONFIG['MODE']} CASH=${PAPER['cash']:.2f}")
+    logging.info("Manual bot v3.4 started")
     updater.start_polling()
     updater.idle()
 
