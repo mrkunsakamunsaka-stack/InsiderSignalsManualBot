@@ -1,15 +1,10 @@
 # manual_bot.py — Coinbase • PAPER trading • €300 Sniper-Safe
-# v3.1 (2025-08-10)
+# v3.2 (2025-08-10)
 # - STRICT, SCORE≥97, Top-50 USD/USDT, 5% alloc, max 5 open
-# - Real-time paper engine (TP/SL, multi-partials optional), PnL & journal
-# - 13 modules ON by default (toggles via Telegram)
-#
-# Commands:
-# /start /scan /paper /positions /pnl /stats [/stats 7d|all|open|perf <sym>]
-# /setscore N /setmax N /setalloc P /setmode RELAXED|STRICT /paperreset
-# Toggles: /edgeon/off /corron/off /regimeon/off /cooldownon/off /focuson/off
-#          /trailon/off /newson/off /recoveron/off /mtp_on/off /sention/off /sessionon/off
-# Extras:  /heatmap /journal /replay <symbol>
+# - Real-time paper engine (multi‑partial TP, trailing SL, one recovery scale‑in)
+# - 13 feature modules (all ON by default) + stats/journal/heatmap
+# - 1h→4h resample fallback if native 4h is missing
+# - Token read from env: TELEGRAM_MANUAL_TOKEN
 
 import os, time, math, random, logging, threading, http.server, socketserver, json
 from datetime import datetime, timedelta, time as dtime
@@ -32,7 +27,10 @@ threading.Thread(target=_keepalive, daemon=True).start()
 START_TS = time.time()
 
 # ---------------- env & sniper defaults ----------------
-TOKEN              = os.getenv("TELEGRAM_MANUAL_TOKEN")               # REQUIRED (set in Render → Environment)
+TOKEN = os.getenv("TELEGRAM_MANUAL_TOKEN")
+if not TOKEN:
+    raise RuntimeError("Missing TELEGRAM_MANUAL_TOKEN in environment variables")
+
 TIMEZONE           = os.getenv("TIMEZONE", "Europe/Dublin")
 DAILY_REPORT_HOUR  = int(os.getenv("DAILY_REPORT_HOUR", "20"))
 FORCED_CHAT_ID     = os.getenv("CHAT_ID")
@@ -40,7 +38,7 @@ tz = pytz.timezone(TIMEZONE)
 
 # cadence
 SCAN_INTERVAL_SECONDS   = int(os.getenv("SCAN_INTERVAL_SECONDS", "30"))
-SYMBOLS_PER_SCAN        = int(os.getenv("SYMBOLS_PER_SCAN", "25"))   # smaller chunks = smoother
+SYMBOLS_PER_SCAN        = int(os.getenv("SYMBOLS_PER_SCAN", "25"))
 SIGNAL_COOLDOWN_MIN     = int(os.getenv("SIGNAL_COOLDOWN_MINUTES", "8"))
 
 # universe cap (sniper mode = 50)
@@ -48,7 +46,7 @@ MAX_PAIRS               = int(os.getenv("MAX_PAIRS", "50"))
 
 # mode & score (sniper = STRICT, 97)
 SCORE_MIN               = int(os.getenv("SCORE_MIN", "97"))
-MODE                    = os.getenv("MODE", "STRICT").strip().upper()  # RELAXED|STRICT
+MODE                    = os.getenv("MODE", "STRICT").strip().upper()
 
 RELAXED = dict(BREAKOUT_LOOKBACK=3, VOLUME_MULTIPLIER=1.05, RSI_MIN=20, RSI_MAX=80,
                USE_EMA_CROSS=True,  EMA_TOL_PCT=0.012, USE_ADX_FILTER=True, ADX_MIN=10,
@@ -66,7 +64,7 @@ FEE_RATE                = float(os.getenv("FEE_RATE", "0.001"))     # 0.10%
 POSITION_PCT            = float(os.getenv("POSITION_PCT", "0.05"))
 MAX_OPEN_TRADES         = int(os.getenv("MAX_OPEN_TRADES", "5"))
 MIN_USD_PER_TRADE       = float(os.getenv("MIN_USD_PER_TRADE", "10"))
-PAPER_START_CASH        = float(os.getenv("PAPER_START_CASH", "300"))  # start with €300≈$300
+PAPER_START_CASH        = float(os.getenv("PAPER_START_CASH", "300"))
 PAPER_CHECK_SECONDS     = int(os.getenv("PAPER_CHECK_SECONDS", "15"))
 
 # keepalive (your URL)
@@ -103,7 +101,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(mes
 CB_BASE = "https://api.exchange.coinbase.com"
 GRAN_5M, GRAN_15M, GRAN_1H, GRAN_4H = 300, 900, 3600, 14400
 session = requests.Session()
-session.headers.update({"User-Agent": "insider-sniper/3.1"})
+session.headers.update({"User-Agent": "insider-sniper/3.2"})
 
 # ---------------- state & persistence ----------------
 CONFIG_PATH = "config.json"
@@ -153,7 +151,7 @@ apply_mode(CONFIG["MODE"])
 
 # ---------------- indicators ----------------
 def ema(arr,p):
-    arr=np.array(arr,float)
+    arr=np.array(arr,float) if arr is not None else None
     if arr is None or len(arr)<p: return None
     a=2/(p+1); out=[arr[0]]
     for x in arr[1:]: out.append(a*x+(1-a)*out[-1])
@@ -234,7 +232,7 @@ def cb_candles(pid, gran, limit=300):
         data=r.json()
         if not isinstance(data,list) or not data: return (None,)*5
         data.sort(key=lambda x:x[0])
-        # dedupe timestamps
+        # de-dupe timestamps
         clean=[]; last_t=0
         for d in data[-limit:]:
             if d[0]>last_t:
@@ -265,7 +263,7 @@ def ticker(pid):
     except Exception:
         return float("nan")
 
-# ---------------- helper tools ----------------
+# ---------------- helpers ----------------
 def r_targets(entry, atr5, side):
     if side=="LONG":
         sl= entry - R_SL*atr5
@@ -286,7 +284,9 @@ def illiquid(h5,l5,c5):
     rng=(max(h5[-24:])-min(l5[-24:]))/max(1e-9,c5[-1])
     return rng<0.0005
 
-# ---------------- regime / breadth / news-stub ----------------
+# ---------------- regime/sentiment/news stubs ----------------
+BTC_STATE = {"adx1h": 0.0}
+ETH_STATE = {"adx1h": 0.0}
 def _update_regime():
     o1,h1,l1,c1,v1 = cb_candles("BTC-USD", GRAN_1H, 220)
     if c1:
@@ -320,7 +320,7 @@ def _news_block():
 def hist_profitable(pid, o5,h5,l5,c5,v5):
     if not CONFIG.get("EDGE",1): return True
     try:
-        if not c5 or len(c5)<200:  # not enough to judge
+        if not c5 or len(c5)<200:
             return True
         BL=BREAKOUT_LOOKBACK
         wins=0; total=0
@@ -371,15 +371,6 @@ def _corr_block(pid, open_symbols):
 def _cooldown_active():
     if not CONFIG.get("COOLDOWN",1): return False
     return time.time() < STREAK.get("cooldown_until", 0)
-def _register_trade_result(pnl_usd):
-    if not CONFIG.get("COOLDOWN",1): return
-    now=time.time()
-    window=now - COOLDOWN_WINDOW_MIN*60
-    STREAK["loss_times"]=[t for t in STREAK.get("loss_times",[]) if t>=window]
-    if pnl_usd<0:
-        STREAK["loss_times"].append(now)
-        if len(STREAK["loss_times"])>=COOLDOWN_LOSSES:
-            STREAK["cooldown_until"]= now + COOLDOWN_PAUSE_MIN*60
 
 # ---------------- universe focus ----------------
 def focus_universe(base):
@@ -407,20 +398,7 @@ def focus_universe(base):
         if len(out)>=MAX_PAIRS: break
     return out or base
 
-# ---------------- sentiment & session ----------------
-def senti_ok():
-    if not CONFIG.get("SENTI",1): return True
-    breadth=_market_breadth()
-    return breadth >= 0.45
-def session_tighten():
-    if not CONFIG.get("SESSION",1): return 0
-    now=datetime.now(tz).hour
-    qf, qt = SESSION_QUIET_FROM, SESSION_QUIET_TO
-    if qf<=qt: quiet = qf <= now <= qt
-    else: quiet = not (qt < now < qf)
-    return 2 if quiet else 0
-
-# ---------------- scoring ----------------
+# ---------------- scoring & signal ----------------
 def score_signal(price, ema50_now, atr5, vol_ok, rsi_val, adx_val):
     s=0
     if vol_ok: s+=25
@@ -431,11 +409,12 @@ def score_signal(price, ema50_now, atr5, vol_ok, rsi_val, adx_val):
     if rsi_val is not None and not math.isnan(rsi_val): s+=max(0,25-abs(50-rsi_val))
     return int(min(100,s))
 
-# ---------------- signal builder ----------------
 def build_signal(pid):
     if _cooldown_active(): return None
     if CONFIG.get("NEWS",1) and _news_block(): return None
-    if not senti_ok(): return None
+    # sentiment
+    breadth=_market_breadth() if CONFIG.get("SENTI",1) else 0.6
+    if breadth < 0.45: return None
 
     o5,h5,l5,c5,v5 = cb_candles(pid,GRAN_5M,240)
     if not c5 or illiquid(h5,l5,c5): return None
@@ -494,10 +473,16 @@ def build_signal(pid):
 
     if CONFIG.get("REGIME",1):
         _update_regime()
-        if BTC_STATE["adx1h"] < 18 and ETH_STATE["adx1h"] < 18:  # choppy
+        if BTC_STATE["adx1h"] < 18 and ETH_STATE["adx1h"] < 18:
             sc -= 2
 
-    sc -= session_tighten()
+    # session tightening
+    now_hour = datetime.now(tz).hour
+    qf, qt = SESSION_QUIET_FROM, SESSION_QUIET_TO
+    quiet = (qf <= now_hour <= qt) if qf <= qt else not (qt < now_hour < qf)
+    if CONFIG.get("SESSION",1) and quiet:
+        sc -= 2
+
     if sc < CONFIG["SCORE_MIN"]: return None
 
     sl,tp1,tp2 = r_targets(last,a5,"LONG")
@@ -511,18 +496,22 @@ def target_chat_id(update: Update=None):
     if FORCED_CHAT_ID: return int(FORCED_CHAT_ID)
     if update: last_chat_id = update.effective_chat.id
     return last_chat_id
+
 def fmt(sig):
     return (f"🚀 <b>{sig['symbol']}</b> LONG (Intraday • {CONFIG['MODE']})\n"
             f"Entry: <b>{sig['entry']}</b>\nTP1: <b>{sig['tp1']}</b> | TP2: <b>{sig['tp2']}</b>\n"
             f"SL: <b>{sig['sl']}</b>\nATR(5m): {sig['atr']} | Score: <b>{sig['score']}</b>/100")
 
-# ---------------- paper engine (MTP/trailing/recovery) ----------------
+# ---------------- paper engine ----------------
 def _can_open(): return len(PAPER["positions"]) < CONFIG["MAX_OPEN_TRADES"]
 def _free_usd():  return float(PAPER["cash"])
 
-def _alloc_for(pid):
+def _corr_adjust(pid):
     open_syms = {p["symbol"] for p in PAPER["positions"].values()}
-    mult = _corr_block(pid, open_syms) if open_syms else 1.0
+    return _corr_block(pid, open_syms) if open_syms else 1.0
+
+def _alloc_for(pid):
+    mult = _corr_adjust(pid)
     if mult == 0.0: return 0.0
     base = max(MIN_USD_PER_TRADE, PAPER["cash"]*float(CONFIG["POSITION_PCT"]))
     return base * mult
@@ -545,18 +534,12 @@ def _open_long(sig, ctx, chat_id):
         "qty_total":qty,"entry_avg":entry,
         "fees_open_total":fee_open,"fees_close_total":0.0,
         "time":datetime.now(tz).isoformat(),
-        "atr":sig["atr"], "scaled_in": False
-    }
-
-    # keep MTP ON (can /mtp_off if you want simpler)
-    # 4 partials at 1.0R, 1.8R, 2.6R, 3.5R
-    r1=entry + 1.0*sig["atr"]; r2=entry + 1.8*sig["atr"]; r3=entry + 2.6*sig["atr"]; r4=entry + 3.5*sig["atr"]
-    pos.update({
-        "tp_levels":[r1,r2,r3,r4],
+        "atr":sig["atr"], "scaled_in": False,
+        "tp_levels":[entry + 1.0*sig["atr"], entry + 1.8*sig["atr"], entry + 2.6*sig["atr"], entry + 3.5*sig["atr"]],
         "tp_fills":[False,False,False,False],
         "tp_qty":[qty*0.25, qty*0.25, qty*0.25, qty*0.25],
         "sl":sig["sl"], "sl_dyn":sig["sl"]
-    })
+    }
 
     PAPER["positions"][pid]=pos
     ctx.bot.send_message(chat_id=chat_id, text=f"🟢 PAPER BUY {sig['symbol']} ${alloc:.2f} | entry {entry} | qty {qty:.6f}")
@@ -577,14 +560,6 @@ def _close_record(p, avg_exit, reason):
     PAPER["realized_pnl"] += pnl
     if pnl>=0: PAPER["wins"]+=1
     else: PAPER["losses"]+=1
-    # streak guard
-    now=time.time()
-    window=now - COOLDOWN_WINDOW_MIN*60
-    STREAK["loss_times"]=[t for t in STREAK.get("loss_times",[]) if t>=window]
-    if pnl<0:
-        STREAK["loss_times"].append(now)
-        if len(STREAK["loss_times"])>=COOLDOWN_LOSSES:
-            STREAK["cooldown_until"]= now + COOLDOWN_PAUSE_MIN*60
     PAPER["closed"].append({
         "id": p["id"], "symbol": p["symbol"], "entry_avg": p["entry_avg"],
         "exit_avg": avg_exit, "qty_total": p["qty_total"],
@@ -619,13 +594,13 @@ def _paper_exits(ctx):
                 PAPER["fees_paid"] = PAPER.get("fees_paid",0.0) + fee
                 p["fees_close_total"] = p.get("fees_close_total",0.0) + fee
                 p["tp_fills"][i] = True
-                # smarter trail
+                # trailing after partial fills
                 if CONFIG.get("TRAIL",1):
                     trail_be = p["entry_avg"]
                     trail_swing = p["entry_avg"] - 0.5*p["atr"]
                     p["sl_dyn"] = max(p["sl_dyn"], trail_be, trail_swing)
 
-        # stop loss after partials
+        # stop loss on remaining
         if px <= p["sl_dyn"]:
             remaining = p["qty_total"] - sum([p["tp_qty"][i] if p["tp_fills"][i] else 0.0 for i in range(4)])
             if remaining > 0:
@@ -642,7 +617,7 @@ def _paper_exits(ctx):
             ctx.bot.send_message(chat_id=target_chat_id(), text=f"🛑 SL {p['symbol']} avg {exit_avg:.6f}")
             continue
 
-        # TP4 finished → close journal entry
+        # TP4 fully filled
         if all(p["tp_fills"]):
             tp_part = sum([p["tp_levels"][i]*p["tp_qty"][i] for i in range(4)])
             exit_avg = tp_part / p["qty_total"]
@@ -757,7 +732,7 @@ def cmd_start(update: Update, ctx: CallbackContext):
         "/scan /paper /positions /pnl /stats /heatmap /journal /replay <sym>\n"
         "/setscore N /setmax N /setalloc P /setmode RELAXED|STRICT /paperreset\n"
         "Toggles: /edgeon/off /corron/off /regimeon/off /cooldownon/off /focuson/off\n"
-        "         /trailon/off /newson/off /recoveron/off /mtp_on/off /sention/off /sessionon/off"
+        "         /trailon/off /newson/off /recoveron/off /mtp_on/off /sention/off /sentioff /sessionon/off"
     ))
 
 def cmd_scan(update, ctx):
@@ -893,7 +868,6 @@ def job_paper(ctx): _paper_exits(ctx)
 
 # ---------------- main ----------------
 def main():
-    if not TOKEN: raise RuntimeError("Missing TELEGRAM_MANUAL_TOKEN")
     up=Updater(TOKEN, use_context=True)
     up.bot.delete_webhook(drop_pending_updates=True)
 
@@ -919,17 +893,17 @@ def main():
                                                                            "wins":0,"losses":0}),
                                                              c.bot.send_message(chat_id=target_chat_id(u), text=f"🧹 Paper reset to ${PAPER_START_CASH:.2f}."))))
     # toggles
-    dp.add_handler(CommandHandler("edgeon",   cmd_edge_on));   dp.add_handler(CommandHandler("edgeoff",  cmd_edge_off))
-    dp.add_handler(CommandHandler("corron",   cmd_corr_on));   dp.add_handler(CommandHandler("corroff",  cmd_corr_off))
-    dp.add_handler(CommandHandler("regimeon", cmd_regime_on)); dp.add_handler(CommandHandler("regimeoff",cmd_regime_off))
-    dp.add_handler(CommandHandler("cooldownon", cmd_cool_on)); dp.add_handler(CommandHandler("cooldownoff", cmd_cool_off))
-    dp.add_handler(CommandHandler("focuson", cmd_focus_on));   dp.add_handler(CommandHandler("focusoff", cmd_focus_off))
-    dp.add_handler(CommandHandler("trailon", cmd_trail_on));   dp.add_handler(CommandHandler("trailoff", cmd_trail_off))
-    dp.add_handler(CommandHandler("newson", cmd_news_on));     dp.add_handler(CommandHandler("newsoff", cmd_news_off))
-    dp.add_handler(CommandHandler("recoveron", cmd_recov_on)); dp.add_handler(CommandHandler("recoveroff", cmd_recov_off))
-    dp.add_handler(CommandHandler("mtp_on", cmd_mtp_on));      dp.add_handler(CommandHandler("mtp_off", cmd_mtp_off))
-    dp.add_handler(CommandHandler("sention", cmd_senti_on));   dp.add_handler(CommandHandler("sentioff", cmd_senti_off))
-    dp.add_handler(CommandHandler("sessionon", cmd_session_on)); dp.add_handler(CommandHandler("sessionoff", cmd_session_off))
+    dp.add_handler(CommandHandler("edgeon",   cmd_edge_on));    dp.add_handler(CommandHandler("edgeoff",  cmd_edge_off))
+    dp.add_handler(CommandHandler("corron",   cmd_corr_on));    dp.add_handler(CommandHandler("corroff",  cmd_corr_off))
+    dp.add_handler(CommandHandler("regimeon", cmd_regime_on));  dp.add_handler(CommandHandler("regimeoff",cmd_regime_off))
+    dp.add_handler(CommandHandler("cooldownon", cmd_cool_on));  dp.add_handler(CommandHandler("cooldownoff", cmd_cool_off))
+    dp.add_handler(CommandHandler("focuson", cmd_focus_on));    dp.add_handler(CommandHandler("focusoff", cmd_focus_off))
+    dp.add_handler(CommandHandler("trailon", cmd_trail_on));    dp.add_handler(CommandHandler("trailoff", cmd_trail_off))
+    dp.add_handler(CommandHandler("newson", cmd_news_on));      dp.add_handler(CommandHandler("newsoff", cmd_news_off))
+    dp.add_handler(CommandHandler("recoveron", cmd_recov_on));  dp.add_handler(CommandHandler("recoveroff", cmd_recov_off))
+    dp.add_handler(CommandHandler("mtp_on", cmd_mtp_on));       dp.add_handler(CommandHandler("mtp_off", cmd_mtp_off))
+    dp.add_handler(CommandHandler("sention", cmd_senti_on));    dp.add_handler(CommandHandler("sentioff", cmd_senti_off))
+    dp.add_handler(CommandHandler("sessionon", cmd_session_on));dp.add_handler(CommandHandler("sessionoff", cmd_session_off))
 
     jq: JobQueue = up.job_queue
     jq.run_repeating(job_scan, interval=SCAN_INTERVAL_SECONDS, first=random.randint(6,12))
