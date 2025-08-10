@@ -7,11 +7,11 @@ services:
     dockerfilePath: ./Dockerfile
 
     envVars:
+      # Telegram bot token — set here or in the Environment tab
       - key: TELEGRAM_MANUAL_TOKEN
-        # ⚠️ Set this in Render → Environment (do NOT commit)
-        sync: false
+        value: "8411524534:AAHppQZKZBNpSTvvX81s9RAUdlVTCTvaiVc"
 
-      # Sniper mode
+      # Sniper defaults
       - key: MODE
         value: STRICT
       - key: SCORE_MIN
