@@ -2,39 +2,38 @@ services:
   - type: web
     name: InsiderSignalsManual
     env: docker
-    plan: free
+    plan: starter
     autoDeploy: true
     dockerfilePath: ./Dockerfile
 
     envVars:
-      # --- required
       - key: TELEGRAM_MANUAL_TOKEN
-        # add your token in Render UI (don’t commit secrets to Git)
+        # ⚠️ Set this in Render → Environment (do NOT commit)
         sync: false
 
-      # --- core settings (can be changed later with bot commands)
+      # Sniper mode
       - key: MODE
-        value: STRICT                # RELAXED or STRICT (you can /setmode)
+        value: STRICT
       - key: SCORE_MIN
-        value: "90"                  # change live with /setscore 1..100
+        value: "97"
 
-      # scanning cadence
+      # Timezone & report
+      - key: TIMEZONE
+        value: Europe/Dublin
+      - key: DAILY_REPORT_HOUR
+        value: "20"
+
+      # Cadence & universe
       - key: SCAN_INTERVAL_SECONDS
         value: "30"
       - key: SYMBOLS_PER_SCAN
-        value: "30"
+        value: "25"
       - key: SIGNAL_COOLDOWN_MINUTES
         value: "8"
       - key: MAX_PAIRS
-        value: "20"                  # scan 20 most common symbols per loop
+        value: "50"
 
-      # risk/sizing (defaults; adjustable in chat)
-      - key: POSITION_PCT
-        value: "0.05"                # 5% per trade (you asked for this)
-      - key: MAX_OPEN_TRADES
-        value: "10"                  # you asked for 10
-
-      # exits (R := ATR(5m))
+      # Risk / exits
       - key: R_TP1
         value: "1.1"
       - key: R_TP2
@@ -43,28 +42,56 @@ services:
         value: "1.1"
       - key: TRAIL_AFTER_TP1
         value: "1"
+      - key: FEE_RATE
+        value: "0.001"
 
-      # timezone & daily summary
-      - key: TIMEZONE
-        value: Europe/Dublin
-      - key: DAILY_REPORT_HOUR
-        value: "20"
+      # Paper sizing
+      - key: POSITION_PCT
+        value: "0.05"
+      - key: MAX_OPEN_TRADES
+        value: "5"
+      - key: MIN_USD_PER_TRADE
+        value: "10"
+      - key: PAPER_START_CASH
+        value: "300"
+      - key: PAPER_CHECK_SECONDS
+        value: "15"
 
-      # keep-alive (your REAL URL)
+      # Historical validator
+      - key: HIST_LOOKBACK_BARS_5M
+        value: "900"
+      - key: HIST_MIN_OCCURRENCES
+        value: "10"
+      - key: HIST_MIN_SUCCESS
+        value: "0.55"
+
+      # Correlation thresholds
+      - key: CORR_BLOCK
+        value: "0.8"
+      - key: CORR_HALF
+        value: "0.6"
+
+      # Streak guard
+      - key: COOLDOWN_LOSSES
+        value: "3"
+      - key: COOLDOWN_WINDOW_MIN
+        value: "120"
+      - key: COOLDOWN_PAUSE_MIN
+        value: "60"
+
+      # Session aware (Dublin)
+      - key: SESSION_QUIET_FROM
+        value: "2"
+      - key: SESSION_QUIET_TO
+        value: "5"
+
+      # Keep-alive
       - key: KEEPALIVE_URL
         value: "https://insidersignalsmanual-olo3.onrender.com"
       - key: KEEPALIVE_SECONDS
         value: "240"
 
-      # paper account & alerts
-      - key: PAPER_START_CASH
-        value: "200"
-      - key: ALERTS
-        value: "1"
-      - key: PAPER_CHECK_SECONDS
-        value: "15"
-
-      # retries / jitter
+      # Retries / jitter
       - key: RETRY_MAX
         value: "4"
       - key: RETRY_BASE_DELAY
