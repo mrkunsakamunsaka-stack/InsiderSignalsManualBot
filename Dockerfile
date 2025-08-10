@@ -1,12 +1,14 @@
 FROM python:3.11-slim
 
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
 WORKDIR /app
-COPY requirements.txt ./
+COPY requirements.txt /app/
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY manual_bot.py ./
+COPY manual_bot.py /app/
 
-# Expose the tiny keep-alive HTTP server
-EXPOSE 10000
+ENV PORT=10000
 
-CMD ["python", "manual_bot.py"]
+CMD ["python", "-u", "manual_bot.py"]
