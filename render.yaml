@@ -1,43 +1,43 @@
 services:
-  - type: web
+  - type: worker
     name: InsiderSignalsManual
     env: docker
-    plan: starter
+    plan: starter          # you're on paid, so no sleeping
     autoDeploy: true
     dockerfilePath: ./Dockerfile
 
     envVars:
-      # (Do NOT hardcode your token here; add it in Render → Environment)
+      # --- core mode & scoring ---
       - key: MODE
         value: STRICT
       - key: SCORE_MIN
         value: "97"
 
-      # Timezone & report
-      - key: TIMEZONE
-        value: Europe/Dublin
-      - key: DAILY_REPORT_HOUR
-        value: "20"
-
-      # Scanner cadence
+      # --- universe & cadence ---
+      - key: MAX_PAIRS
+        value: "50"
       - key: SCAN_INTERVAL_SECONDS
         value: "30"
       - key: SYMBOLS_PER_SCAN
         value: "25"
       - key: SIGNAL_COOLDOWN_MINUTES
         value: "8"
-      - key: MAX_PAIRS
-        value: "50"
 
-      # Sizing & risk
+      # --- sizing & risk (paper) ---
       - key: POSITION_PCT
-        value: "0.05"
+        value: "0.05"      # 5% per trade
       - key: MAX_OPEN_TRADES
-        value: "10"
+        value: "5"
       - key: MIN_USD_PER_TRADE
         value: "10"
       - key: PAPER_START_CASH
         value: "300"
+      - key: PAPER_CHECK_SECONDS
+        value: "15"
+      - key: FEE_RATE
+        value: "0.001"     # 0.10% assumed
+
+      # --- exits (R = ATR 5m) ---
       - key: R_TP1
         value: "1.1"
       - key: R_TP2
@@ -47,7 +47,13 @@ services:
       - key: TRAIL_AFTER_TP1
         value: "1"
 
-      # Historical validator
+      # --- timezone/report ---
+      - key: TIMEZONE
+        value: Europe/Dublin
+      - key: DAILY_REPORT_HOUR
+        value: "20"
+
+      # --- historical validator ---
       - key: HIST_LOOKBACK_BARS_5M
         value: "900"
       - key: HIST_MIN_OCCURRENCES
@@ -55,25 +61,25 @@ services:
       - key: HIST_MIN_SUCCESS
         value: "0.55"
 
-      # Correlation & cooldown
+      # --- correlation controls ---
       - key: CORR_BLOCK
         value: "0.8"
       - key: CORR_HALF
         value: "0.6"
+
+      # --- streak guard & session ---
       - key: COOLDOWN_LOSSES
         value: "3"
       - key: COOLDOWN_WINDOW_MIN
         value: "120"
       - key: COOLDOWN_PAUSE_MIN
         value: "60"
-
-      # Quiet hours
       - key: SESSION_QUIET_FROM
         value: "2"
       - key: SESSION_QUIET_TO
         value: "5"
 
-      # Retries
+      # --- retries/jitter ---
       - key: RETRY_MAX
         value: "4"
       - key: RETRY_BASE_DELAY
