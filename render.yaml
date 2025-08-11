@@ -1,15 +1,15 @@
 services:
-  - type: worker                # background worker (no web port)
+  - type: worker
     name: InsiderSignalsManual
     env: docker
-    plan: starter               # you're on paid plan; OK
+    plan: starter
     autoDeploy: true
     dockerfilePath: ./Dockerfile
 
     envVars:
-      # --- Required secret (add in Render > Environment before Start) ---
+      # --- Required secret (set in Render > Environment) ---
       - key: TELEGRAM_MANUAL_TOKEN
-        value: ""               # leave empty here; set in Dashboard
+        value: ""   # paste in Render dashboard before starting
 
       # --- Optional: lock bot to one chat (numeric Telegram chat id) ---
       - key: CHAT_ID
@@ -29,7 +29,7 @@ services:
       - key: SIGNAL_COOLDOWN_MINUTES
         value: "8"
       - key: MAX_PAIRS
-        value: "60"
+        value: "60"   # keep 60 unless you want 100
 
       # --- Mode & score floor ---
       - key: MODE
@@ -46,10 +46,8 @@ services:
         value: "1.1"
       - key: TRAIL_AFTER_TP1
         value: "1"
-      - key: LADDER_TRAIL
-        value: "1"
-      - key: TP_SPLITS
-        value: "40,35,25"   # TP1/TP2/TP3 splits (% of position)
+      - key: FEE_RATE
+        value: "0.001"
 
       # --- Paper sizing (you asked: 5% alloc, max 10 open) ---
       - key: POSITION_PCT
@@ -60,8 +58,10 @@ services:
         value: "10"
       - key: PAPER_START_CASH
         value: "300"
+
+      # --- FAST TP/SL CHECKS (changed to 2 seconds) ---
       - key: PAPER_CHECK_SECONDS
-        value: "15"
+        value: "2"
 
       # --- Feature flags (1=on, 0=off) ---
       - key: EDGE
