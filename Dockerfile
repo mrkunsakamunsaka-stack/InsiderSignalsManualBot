@@ -1,33 +1,39 @@
-# Smaller, safer Python image
-FROM python:3.11-slim
+# ---- Build stage ----
+FROM python:3.11-slim AS build
 
-# System deps (build tools not needed for these libs)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-      curl ca-certificates tzdata tini \
-    && rm -rf /var/lib/apt/lists/*
-
-# Working dir
-WORKDIR /app
-
-# Copy only what we need first (better layer caching)
-COPY requirements.txt /app/requirements.txt
-
-# Install Python deps (no cache -> smaller image)
-RUN pip install --no-cache-dir -r /app/requirements.txt
-
-# Copy app
-COPY manual_bot.py /app/manual_bot.py
-
-# Non-root user
-RUN useradd -m botuser
-USER botuser
-
-# Environment for Python
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-# Use tini as init to reap zombies
-ENTRYPOINT ["/usr/bin/tini", "--"]
+# System deps
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
-# Start the worker
+WORKDIR /app
+
+# Copy and install deps separately for layer caching
+COPY requirements.txt .
+RUN pip install --upgrade pip \
+    && pip wheel --no-cache-dir --wheel-dir /wheels -r requirements.txt
+
+# ---- Runtime stage ----
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+# Install wheels
+COPY --from=build /wheels /wheels
+RUN pip install --no-cache /wheels/*
+
+# Copy app
+COPY manual_bot.py . 
+
+# Non-root user (optional hardening)
+RUN useradd -m botuser
+USER botuser
+
+# Worker process (no HTTP port needed)
 CMD ["python", "manual_bot.py"]
