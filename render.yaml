@@ -2,26 +2,26 @@ services:
   - type: worker
     name: InsiderSignalsManual
     env: docker
-    plan: starter
+    plan: starter          # you're on paid; starter is fine
     autoDeploy: true
     dockerfilePath: ./Dockerfile
 
     envVars:
-      # --- Required secret (set in Render > Environment) ---
+      # --- REQUIRED (set value in Render dashboard before starting) ---
       - key: TELEGRAM_MANUAL_TOKEN
-        value: ""   # paste in Render dashboard before starting
+        value: ""
 
-      # --- Optional: lock bot to one chat (numeric Telegram chat id) ---
+      # --- Optional: lock bot to one Telegram chat id (numeric) ---
       - key: CHAT_ID
         value: ""
 
-      # --- Timezone & daily report hour ---
+      # --- Timezone & reports ---
       - key: TIMEZONE
         value: Europe/Dublin
       - key: DAILY_REPORT_HOUR
         value: "20"
 
-      # --- Scan cadence & universe size ---
+      # --- Scan cadence & universe ---
       - key: SCAN_INTERVAL_SECONDS
         value: "30"
       - key: SYMBOLS_PER_SCAN
@@ -29,9 +29,9 @@ services:
       - key: SIGNAL_COOLDOWN_MINUTES
         value: "8"
       - key: MAX_PAIRS
-        value: "60"   # keep 60 unless you want 100
+        value: "60"
 
-      # --- Mode & score floor ---
+      # --- Mode & score ---
       - key: MODE
         value: STRICT
       - key: SCORE_MIN
@@ -49,7 +49,7 @@ services:
       - key: FEE_RATE
         value: "0.001"
 
-      # --- Paper sizing (you asked: 5% alloc, max 10 open) ---
+      # --- Paper sizing ---
       - key: POSITION_PCT
         value: "0.05"
       - key: MAX_OPEN_TRADES
@@ -58,10 +58,8 @@ services:
         value: "10"
       - key: PAPER_START_CASH
         value: "300"
-
-      # --- FAST TP/SL CHECKS (changed to 2 seconds) ---
       - key: PAPER_CHECK_SECONDS
-        value: "2"
+        value: "15"
 
       # --- Feature flags (1=on, 0=off) ---
       - key: EDGE
@@ -112,3 +110,9 @@ services:
         value: "2"
       - key: SESSION_QUIET_TO
         value: "5"
+
+      # --- NEW safeguards ---
+      - key: ATR_FLOOR_PCT         # min ATR as % of price to prevent crazy SL spans
+        value: "0.001"             # = 0.1%
+      - key: ALERT_BATCH_SECONDS    # batch Telegram alerts to avoid 429s
+        value: "3"
