@@ -1,5 +1,5 @@
 services:
-  - type: worker
+  - type: worker                 # background worker (no HTTP port required)
     name: InsiderSignalsManual
     env: docker
     plan: starter
@@ -7,15 +7,21 @@ services:
     dockerfilePath: ./Dockerfile
 
     envVars:
+      # --- Required secret (set in Render > Environment) ---
       - key: TELEGRAM_MANUAL_TOKEN
-        value: ""                 # set this in Render Dashboard (Environment)
+        value: ""                # fill in via Dashboard before starting
 
+      # --- Optional: lock bot to one chat (numeric Telegram chat id) ---
+      - key: CHAT_ID
+        value: ""
+
+      # --- Timezone & daily report hour ---
       - key: TIMEZONE
         value: Europe/Dublin
       - key: DAILY_REPORT_HOUR
         value: "20"
 
-      # scan cadence & universe
+      # --- Scan cadence & universe size ---
       - key: SCAN_INTERVAL_SECONDS
         value: "30"
       - key: SYMBOLS_PER_SCAN
@@ -23,31 +29,27 @@ services:
       - key: SIGNAL_COOLDOWN_MINUTES
         value: "8"
       - key: MAX_PAIRS
-        value: "60"
+        value: "60"      # set to 100 if/when you want top 100
 
-      # mode & score
+      # --- Mode & score floor ---
       - key: MODE
         value: STRICT
       - key: SCORE_MIN
         value: "97"
 
-      # exits & TPs
+      # --- Exits & trailing ---
       - key: R_TP1
-        value: "1.0"
+        value: "1.1"
       - key: R_TP2
-        value: "2.0"
-      - key: R_TP3
-        value: "3.0"
+        value: "2.2"
       - key: R_SL
         value: "1.1"
-      - key: TP_LEVELS
-        value: "3"
-      - key: TP_SPLIT
-        value: "50,30,20"
+      - key: TRAIL_AFTER_TP1
+        value: "1"
       - key: FEE_RATE
         value: "0.001"
 
-      # paper sizing
+      # --- Paper sizing (you asked: 5% alloc, max 10 open) ---
       - key: POSITION_PCT
         value: "0.05"
       - key: MAX_OPEN_TRADES
@@ -57,9 +59,9 @@ services:
       - key: PAPER_START_CASH
         value: "300"
       - key: PAPER_CHECK_SECONDS
-        value: "15"
+        value: "5"        # << faster exit checks (was 15)
 
-      # feature flags
+      # --- Feature flags (1=on, 0=off) ---
       - key: EDGE
         value: "1"
       - key: CORR
@@ -71,7 +73,7 @@ services:
       - key: SESSION
         value: "1"
 
-      # historical validator
+      # --- Historical quick validator ---
       - key: HIST_LOOKBACK_BARS_5M
         value: "900"
       - key: HIST_MIN_OCCURRENCES
@@ -79,25 +81,21 @@ services:
       - key: HIST_MIN_SUCCESS
         value: "0.55"
 
-      # correlation thresholds
+      # --- Correlation thresholds ---
       - key: CORR_BLOCK
         value: "0.8"
       - key: CORR_HALF
         value: "0.6"
 
-      # streak / day guard
+      # --- Streak guard ---
       - key: COOLDOWN_LOSSES
         value: "3"
       - key: COOLDOWN_WINDOW_MIN
         value: "120"
       - key: COOLDOWN_PAUSE_MIN
         value: "60"
-      - key: DAY_MAX_DD_PCT
-        value: "3.0"
-      - key: DAY_LOCK_MIN
-        value: "180"
 
-      # request hygiene
+      # --- Request hygiene ---
       - key: RETRY_MAX
         value: "4"
       - key: RETRY_BASE_DELAY
@@ -106,3 +104,9 @@ services:
         value: "50"
       - key: REQ_JITTER_MAX_MS
         value: "140"
+
+      # --- Quiet session window (local TZ) ---
+      - key: SESSION_QUIET_FROM
+        value: "2"
+      - key: SESSION_QUIET_TO
+        value: "5"
