@@ -1,53 +1,33 @@
-# ---------- Build stage ----------
-FROM python:3.11-slim AS builder
+# Smaller, safer Python image
+FROM python:3.11-slim
 
+# System deps (build tools not needed for these libs)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      curl ca-certificates tzdata tini \
+    && rm -rf /var/lib/apt/lists/*
+
+# Working dir
+WORKDIR /app
+
+# Copy only what we need first (better layer caching)
+COPY requirements.txt /app/requirements.txt
+
+# Install Python deps (no cache -> smaller image)
+RUN pip install --no-cache-dir -r /app/requirements.txt
+
+# Copy app
+COPY manual_bot.py /app/manual_bot.py
+
+# Non-root user
+RUN useradd -m botuser
+USER botuser
+
+# Environment for Python
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-WORKDIR /app
+# Use tini as init to reap zombies
+ENTRYPOINT ["/usr/bin/tini", "--"]
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential ca-certificates curl && \
-    rm -rf /var/lib/apt/lists/*
-
-# Copy reqs first for better caching
-COPY requirements.txt ./
-
-RUN pip install --upgrade pip && \
-    pip wheel --no-cache-dir --wheel-dir /wheels -r requirements.txt
-
-# ---------- Runtime stage ----------
-FROM python:3.11-slim AS runtime
-
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
-
-WORKDIR /app
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates tzdata && \
-    rm -rf /var/lib/apt/lists/*
-
-# Bring in wheels + requirements.txt
-COPY --from=builder /wheels /wheels
-COPY --from=builder /app/requirements.txt ./requirements.txt
-
-# Install from prebuilt wheels
-RUN pip install --no-cache-dir --find-links=/wheels -r requirements.txt && \
-    rm -rf /wheels
-
-# Copy the app code
-COPY . /app
-
-# Prepare writable state files
-RUN useradd -m appuser \
- && chown -R appuser:appuser /app \
- && touch /app/paper.json /app/config.json \
- && chown appuser:appuser /app/paper.json /app/config.json
-
-USER appuser
-
-HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-  CMD python -c "import os,sys; sys.exit(0 if os.path.exists('/app/manual_bot.py') else 1)"
-
+# Start the worker
 CMD ["python", "manual_bot.py"]
