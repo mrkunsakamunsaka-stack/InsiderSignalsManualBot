@@ -1,15 +1,15 @@
 services:
-  - type: worker                 # <-- background worker (no HTTP port required)
+  - type: worker                # background worker (no web port)
     name: InsiderSignalsManual
     env: docker
-    plan: starter
+    plan: starter               # you're on paid plan; OK
     autoDeploy: true
     dockerfilePath: ./Dockerfile
 
     envVars:
-      # --- Required secret (set in Render > Environment) ---
+      # --- Required secret (add in Render > Environment before Start) ---
       - key: TELEGRAM_MANUAL_TOKEN
-        value: ""                # fill in via Dashboard before starting
+        value: ""               # leave empty here; set in Dashboard
 
       # --- Optional: lock bot to one chat (numeric Telegram chat id) ---
       - key: CHAT_ID
@@ -46,8 +46,10 @@ services:
         value: "1.1"
       - key: TRAIL_AFTER_TP1
         value: "1"
-      - key: FEE_RATE
-        value: "0.001"
+      - key: LADDER_TRAIL
+        value: "1"
+      - key: TP_SPLITS
+        value: "40,35,25"   # TP1/TP2/TP3 splits (% of position)
 
       # --- Paper sizing (you asked: 5% alloc, max 10 open) ---
       - key: POSITION_PCT
