@@ -1,24 +1,12 @@
-# git & vcs
 .git
 .gitignore
-
-# python junk
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
-*.log
-
-# local envs
+.wheels/
 .env
-.venv
-venv/
-
-# editor & OS
-.vscode/
-.idea/
 .DS_Store
-
-# docs/tests
-README.md
-tests/
+*.log
+paper.json
+journal.jsonl
