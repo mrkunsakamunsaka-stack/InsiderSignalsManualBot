@@ -39,11 +39,11 @@ RUN pip install --no-cache-dir --find-links=/wheels -r requirements.txt && \
 # Copy the app code
 COPY . /app
 
-# Prepare writable state files
+# Prepare writable state files (paper/config/journal)
 RUN useradd -m appuser \
  && chown -R appuser:appuser /app \
- && touch /app/paper.json /app/config.json \
- && chown appuser:appuser /app/paper.json /app/config.json
+ && touch /app/paper.json /app/config.json /app/journal.jsonl \
+ && chown appuser:appuser /app/paper.json /app/config.json /app/journal.jsonl
 
 USER appuser
 
