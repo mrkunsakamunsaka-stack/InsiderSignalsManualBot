@@ -12,6 +12,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Copy reqs first for better caching
 COPY requirements.txt ./
+
 RUN pip install --upgrade pip && \
     pip wheel --no-cache-dir --wheel-dir /wheels -r requirements.txt
 
@@ -41,8 +42,8 @@ COPY . /app
 # Prepare writable state files
 RUN useradd -m appuser \
  && chown -R appuser:appuser /app \
- && touch /app/paper.json /app/config.json /app/journal.jsonl \
- && chown appuser:appuser /app/paper.json /app/config.json /app/journal.jsonl
+ && touch /app/paper.json /app/config.json \
+ && chown appuser:appuser /app/paper.json /app/config.json
 
 USER appuser
 
