@@ -1,1 +1,14 @@
+.git
+.gitignore
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.wheels/
+.env
+.DS_Store
+*.log
+paper.json
+config.json
+journal.jsonl
 
