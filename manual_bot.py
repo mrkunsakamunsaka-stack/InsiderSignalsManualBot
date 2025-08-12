@@ -1,11 +1,12 @@
 # manual_bot.py — Coinbase • PAPER trading • €300 Sniper-Safe
-# v3.6.1 (2025-08-12)
-# - LONG + SHORT support (SHORTS_ENABLED env)
-# - 3 TPs (TP1/TP2/TP3) with ratcheting SL (BE → TP1 → TP2) for both long & short
-# - Dashboard shows Longs and Shorts in separate sections
-# - Keeps v3.6 features: STRICT mode, score≥97, priority scan, watchdog, day/cooldown guards, etc.
+# v3.7 (2025-08-12)
+# - Dashboard (/dashboard) + /help
+# - Runtime controls: /setmaxpairs /setscan /setchunks /setshorts
+# - Optional SHORT signals & paper engine (mirrors 3-TP ladder + ratchet)
+# - Keeps: STRICT, SCORE≥97, Top-60 (or MAX_PAIRS) USD/USDT, chunked scan, 3 TPs
+# - Safety: EDGE/CORR/REGIME/COOLDOWN/SESSION, candle cache, 1h→4h fallback, day lock
 
-import os, time, math, random, logging, threading, json, traceback
+import os, time, math, random, logging, threading, json, traceback, tempfile
 from datetime import datetime, timedelta, time as dtime, date
 import pytz, requests, numpy as np
 from telegram import Update, ParseMode
@@ -29,6 +30,9 @@ SYMBOLS_PER_SCAN        = int(os.getenv("SYMBOLS_PER_SCAN", "20"))
 SIGNAL_COOLDOWN_MIN     = int(os.getenv("SIGNAL_COOLDOWN_MINUTES", "8"))
 MAX_PAIRS               = int(os.getenv("MAX_PAIRS", "60"))
 
+# shorts
+ALLOW_SHORTS            = int(os.getenv("ALLOW_SHORTS", "0"))  # 0 off by default; enable via /setshorts 1
+
 # mode & score
 SCORE_MIN               = int(os.getenv("SCORE_MIN", "97"))
 MODE                    = os.getenv("MODE", "STRICT").strip().upper()
@@ -43,8 +47,9 @@ STRICT  = dict(BREAKOUT_LOOKBACK=6, VOLUME_MULTIPLIER=1.20, RSI_MIN=35, RSI_MAX=
 # exits (R = ATR 5m) and 3-TP ladder
 R_TP1, R_TP2, R_TP3     = float(os.getenv("R_TP1", "1.0")), float(os.getenv("R_TP2","2.0")), float(os.getenv("R_TP3","3.0"))
 R_SL                    = float(os.getenv("R_SL","1.1"))
-TRAIL_AFTER_TP1         = True  # trail to BE after TP1
-TP_SPLIT                = os.getenv("TP_SPLIT", "50,30,20").replace(" ", "")
+TRAIL_AFTER_TP1         = True  # always trail after TP1 (to BE)
+# TP split config: e.g. "30,30,40" (percent)
+TP_SPLIT                = os.getenv("TP_SPLIT", "30,30,40").replace(" ", "")
 TP_LEVELS               = int(os.getenv("TP_LEVELS", "3"))
 
 FEE_RATE                = float(os.getenv("FEE_RATE", "0.001"))     # 0.10%
@@ -54,9 +59,9 @@ POSITION_PCT            = float(os.getenv("POSITION_PCT", "0.05"))
 MAX_OPEN_TRADES         = int(os.getenv("MAX_OPEN_TRADES", "10"))
 MIN_USD_PER_TRADE       = float(os.getenv("MIN_USD_PER_TRADE", "10"))
 PAPER_START_CASH        = float(os.getenv("PAPER_START_CASH", "300"))
-PAPER_CHECK_SECONDS     = int(os.getenv("PAPER_CHECK_SECONDS", "15"))
+PAPER_CHECK_SECONDS     = int(os.getenv("PAPER_CHECK_SECONDS", "5"))
 
-# feature flags
+# feature flags (1/0)
 FLAGS = {
     "EDGE": int(os.getenv("EDGE", "1")),
     "CORR": int(os.getenv("CORR", "1")),
@@ -64,7 +69,6 @@ FLAGS = {
     "COOLDOWN": int(os.getenv("COOLDOWN", "1")),
     "SESSION": int(os.getenv("SESSION", "1")),
 }
-SHORTS_ENABLED          = int(os.getenv("SHORTS_ENABLED", "0"))  # 0=off, 1=on (paper only)
 
 # historical validator thresholds
 HIST_LOOKBACK_BARS_5M   = int(os.getenv("HIST_LOOKBACK_BARS_5M", "900"))
@@ -94,7 +98,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(mes
 CB_BASE = "https://api.exchange.coinbase.com"
 GRAN_5M, GRAN_15M, GRAN_1H, GRAN_4H = 300, 900, 3600, 14400
 session = requests.Session()
-session.headers.update({"User-Agent": "insider-sniper/3.6.1"})
+session.headers.update({"User-Agent": "insider-sniper/3.7"})
 
 # ---------- state & persistence ----------
 CONFIG_PATH = "config.json"
@@ -104,8 +108,13 @@ JOURNAL_PATH= "journal.jsonl"
 CONFIG = {
     "MODE": MODE, "SCORE_MIN": SCORE_MIN,
     "POSITION_PCT": POSITION_PCT, "MAX_OPEN_TRADES": MAX_OPEN_TRADES,
+    "MAX_PAIRS": MAX_PAIRS,
+    "SCAN_INTERVAL_SECONDS": SCAN_INTERVAL_SECONDS,
+    "SYMBOLS_PER_SCAN": SYMBOLS_PER_SCAN,
+    "ALLOW_SHORTS": ALLOW_SHORTS,
     **FLAGS
 }
+
 signals = []
 last_signal_time = {}
 scan_cursor = 0
@@ -129,7 +138,7 @@ LAST_SCAN_TS = time.time()
 SCAN_LOCK = threading.Lock()
 CHUNK_SIZE = SYMBOLS_PER_SCAN
 
-# ---------- I/O helpers ----------
+# ---------- small persistence helpers ----------
 def _load_json(path, default):
     try:
         if os.path.exists(path):
@@ -138,9 +147,14 @@ def _load_json(path, default):
         logging.warning(f"load {path} error: {e}")
     return default
 
-def _save_json(path, data):
+def _save_json_atomic(path, data):
     try:
-        with open(path,"w") as f: json.dump(data,f)
+        d = json.dumps(data, separators=(",", ":"), ensure_ascii=False)
+        dirn = os.path.dirname(path) or "."
+        with tempfile.NamedTemporaryFile("w", dir=dirn, delete=False) as tf:
+            tmp = tf.name
+            tf.write(d)
+        os.replace(tmp, path)
     except Exception as e:
         logging.warning(f"save {path} error: {e}")
 
@@ -152,10 +166,16 @@ def _append_journal(obj):
         pass
 
 def load_config():
-    global CONFIG
+    global CONFIG, MAX_PAIRS, SCAN_INTERVAL_SECONDS, SYMBOLS_PER_SCAN, ALLOW_SHORTS
     d = _load_json(CONFIG_PATH, None)
-    if d: CONFIG.update(d)
-def save_config(): _save_json(CONFIG_PATH, CONFIG)
+    if d: 
+        CONFIG.update(d)
+        MAX_PAIRS = int(CONFIG.get("MAX_PAIRS", MAX_PAIRS))
+        SCAN_INTERVAL_SECONDS = int(CONFIG.get("SCAN_INTERVAL_SECONDS", SCAN_INTERVAL_SECONDS))
+        SYMBOLS_PER_SCAN = int(CONFIG.get("SYMBOLS_PER_SCAN", SYMBOLS_PER_SCAN))
+        ALLOW_SHORTS = int(CONFIG.get("ALLOW_SHORTS", ALLOW_SHORTS))
+
+def save_config(): _save_json_atomic(CONFIG_PATH, CONFIG)
 
 def load_paper():
     global PAPER, EQUITY_OPEN, START_OF_DAY
@@ -164,8 +184,7 @@ def load_paper():
     START_OF_DAY = date.today()
     EQUITY_OPEN  = PAPER["equity"]
 
-def save_paper():
-    _save_json(PAPER_PATH, PAPER)
+def save_paper(): _save_json_atomic(PAPER_PATH, PAPER)
 
 load_config()
 load_paper()
@@ -230,8 +249,7 @@ def _get(url, params=None, timeout=15):
         try:
             r=session.get(url, params=params, timeout=timeout)
             if r.status_code in (429,502,503,504): raise RequestException(f"HTTP {r.status_code}")
-            if r.status_code==400:
-                r.raise_for_status()
+            if r.status_code==400: r.raise_for_status()
             r.raise_for_status(); return r
         except (RequestException, RemoteDisconnected):
             if k==RETRY_MAX-1: raise
@@ -240,10 +258,11 @@ def _get(url, params=None, timeout=15):
 # ---------- small candle cache ----------
 CANDLE_CACHE = {}  # key=(pid,gran) -> (expires,(o,h,l,c,v))
 CACHE_TTL = 3.0
+
 def _cache_get(pid, gran):
     v=CANDLE_CACHE.get((pid,gran))
-    if v and v[0] > time.time(): return v[1]
-    return None
+    return v[1] if v and v[0] > time.time() else None
+
 def _cache_put(pid, gran, data):
     CANDLE_CACHE[(pid,gran)] = (time.time()+CACHE_TTL, data)
 
@@ -368,21 +387,25 @@ def hist_profitable(pid, o5,h5,l5,c5,v5):
         ema20=ema(c5,20)
         for i in range(BL+30, min(len(c5)-1, HIST_LOOKBACK_BARS_5M), 6):
             hh=max(h5[i-BL:i]); ll=min(l5[i-BL:i]); last=c5[i]
-            cross_up=(ema20 is not None and c5[i]>ema20[i] and c5[i-1]<=ema20[i-1])
-            cross_dn=(ema20 is not None and c5[i]<ema20[i] and c5[i-1]>=ema20[i-1])
-            brk_up  =(last>hh); brk_dn=(last<ll)
-            trig = brk_up or (USE_EMA_CROSS and cross_up) or brk_dn or (USE_EMA_CROSS and cross_dn)
-            if not trig: continue
+            cross_up  =(ema20 is not None and c5[i]>ema20[i] and c5[i-1]<=ema20[i-1])
+            cross_down=(ema20 is not None and c5[i]<ema20[i] and c5[i-1]>=ema20[i-1])
+            brk_up  = last>hh
+            brk_dn  = last<ll
+            long_like  = brk_up  or (USE_EMA_CROSS and cross_up)
+            short_like = brk_dn  or (USE_EMA_CROSS and cross_down)
+            if not (long_like or (ALLOW_SHORTS and short_like)): continue
             atr5=atr(h5[:i+1],l5[:i+1],c5[:i+1],14)
             if atr5 is None or math.isnan(atr5[-1]): continue
-            _sl,_tp1,_tp2,_tp3=r_targets(last,float(atr5[-1]),"LONG")
+            _sl,_tp1,_tp2,_tp3=r_targets(last,float(atr5[-1]),"LONG" if long_like else "SHORT")
             hit=None
             for j in range(i+1, min(i+13, len(c5))):
-                if c5[j]>=_tp2: hit="TP2_LONG"; break
-                if c5[j]<=last - R_SL*float(atr5[-1]): hit="SL_LONG"; break
+                if (long_like and c5[j]>=_tp2) or ((not long_like) and c5[j]<=_tp2):
+                    hit="TP2"; break
+                if (long_like and c5[j]<=_sl) or ((not long_like) and c5[j]>=_sl):
+                    hit="SL"; break
             if hit:
                 total+=1
-                if hit=="TP2_LONG": wins+=1
+                if hit=="TP2": wins+=1
         if total < HIST_MIN_OCCURRENCES: return True
         return (wins/total) >= HIST_MIN_SUCCESS
     except Exception as e:
@@ -430,7 +453,7 @@ def add_result_winloss(pnl_usd):
     if dd_pct >= DAY_MAX_DD_PCT:
         DAY_LOCK_UNTIL = time.time() + DAY_LOCK_MIN*60
 
-# ---------- scoring ----------
+# ---------- scoring & signal ----------
 def score_signal(price, ema50_now, a5, vol_ok, rsi_val, adx_val):
     s=0
     if vol_ok: s+=25
@@ -439,12 +462,25 @@ def score_signal(price, ema50_now, a5, vol_ok, rsi_val, adx_val):
         dist=abs(price-ema50_now)/ema50_now
         s+=max(0,25-100*dist)
     if rsi_val is not None and not math.isnan(rsi_val): s+=max(0,25-abs(50-rsi_val))
-    if FLAGS.get("REGIME",1) and BTC_STATE["adx1h"] < 18 and ETH_STATE["adx1h"] < 18: s -= 2
+    if FLAGS.get("REGIME",1):
+        if BTC_STATE["adx1h"] < 18 and ETH_STATE["adx1h"] < 18: s -= 2
     if FLAGS.get("SESSION",1) and _session_quiet_now(): s -= 2
     return int(min(100,max(0,s)))
 
-# ---------- signals (LONG + SHORT) ----------
-def _signal_core(pid, side, o5,h5,l5,c5,v5, o15,h15,l15,c15,v15, o1,h1,l1,c1,v1, c4h):
+def build_signal_for_side(pid, side):
+    o5,h5,l5,c5,v5 = cb_candles(pid,GRAN_5M,240)
+    if not c5 or illiquid(h5,l5,c5): return None
+
+    o15,h15,l15,c15,v15 = cb_candles(pid,GRAN_15M,200)
+    o1,h1,l1,c1,v1      = cb_candles(pid,GRAN_1H,220)
+
+    c4h=None
+    if USE_HTF_FILTER:
+        o4h,h4h,l4h,c4h,v4h = cb_candles(pid,GRAN_4H,220)
+        if not c4h and c1:
+            _o,_h,_l,_c,_v = resample_1h_to_4h(o1,h1,l1,c1,v1)
+            c4h=_c
+
     ema50_1h=ema(c1,50) if c1 else None
     ema200_1h=ema(c1,200) if c1 else None
     if ema50_1h is None or ema200_1h is None: return None
@@ -457,28 +493,29 @@ def _signal_core(pid, side, o5,h5,l5,c5,v5, o15,h15,l15,c15,v15, o1,h1,l1,c1,v1,
         adx_ok = (adx1h is not None and not math.isnan(adx1h[-1]) and adx1h[-1]>=ADX_MIN)
 
     BL=BREAKOUT_LOOKBACK
-    last=c5[-1]
-    hh=max(h5[-(BL+1):-1]); ll=min(l5[-(BL+1):-1])
+    hh=max(h5[-(BL+1):-1]); ll=min(l5[-(BL+1):-1]); last=c5[-1]
     vol_avg=sum(v5[-(BL+1):-1])/BL; last_vol=v5[-1]
     r=rsi(c15,14)
     if r is None or math.isnan(r[-1]): return None
     r_ok = (RSI_MIN <= r[-1] <= RSI_MAX)
 
     ema20_5=ema(c5,20)
-    cross_up= ema20_5 is not None and c5[-1]>ema20_5[-1] and c5[-2]<=ema20_5[-2]
-    cross_dn= ema20_5 is not None and c5[-1]<ema20_5[-1] and c5[-2]>=ema20_5[-2]
+    cross_up  = ema20_5 is not None and c5[-1]>ema20_5[-1] and c5[-2]<=ema20_5[-2]
+    cross_down= ema20_5 is not None and c5[-1]<ema20_5[-1] and c5[-2]>=ema20_5[-2]
+    brk_up = last>hh
+    brk_dn = last<ll
 
     if side=="LONG":
-        trig = (last>hh) or (USE_EMA_CROSS and cross_up)
-        trend = (last>ema50_now) or near(last, ema50_now, EMA_TOL_PCT)
+        trig = brk_up or (USE_EMA_CROSS and cross_up)
+        trend_ok = (last>ema50_now) or near(last, ema50_now, EMA_TOL_PCT)
         htf_ok=True
-        if USE_HTF_FILTER and c4h is not None and ema200_4h is not None:
+        if USE_HTF_FILTER and ema200_4h is not None:
             htf_ok = (c1[-1] >= (1-HTF_TOL_PCT)*ema200_1h[-1]) and (c4h[-1] >= (1-HTF_TOL_PCT)*ema200_4h[-1])
-    else:  # SHORT
-        trig = (last<ll) or (USE_EMA_CROSS and cross_dn)
-        trend = (last<ema50_now) or near(last, ema50_now, EMA_TOL_PCT)
+    else:
+        trig = brk_dn or (USE_EMA_CROSS and cross_down)
+        trend_ok = (last<ema50_now) or near(last, ema50_now, EMA_TOL_PCT)
         htf_ok=True
-        if USE_HTF_FILTER and c4h is not None and ema200_4h is not None:
+        if USE_HTF_FILTER and ema200_4h is not None:
             htf_ok = (c1[-1] <= (1+HTF_TOL_PCT)*ema200_1h[-1]) and (c4h[-1] <= (1+HTF_TOL_PCT)*ema200_4h[-1])
 
     vol_ok = last_vol >= VOLUME_MULTIPLIER*max(vol_avg,1e-9)
@@ -487,7 +524,7 @@ def _signal_core(pid, side, o5,h5,l5,c5,v5, o15,h15,l15,c15,v15, o1,h1,l1,c1,v1,
     if atr5 is None or math.isnan(atr5[-1]): return None
     a5=float(atr5[-1])
 
-    ok = trig and vol_ok and r_ok and trend and htf_ok and adx_ok
+    ok = trig and vol_ok and r_ok and trend_ok and htf_ok and adx_ok
     if not ok: return None
 
     _update_regime()
@@ -495,37 +532,19 @@ def _signal_core(pid, side, o5,h5,l5,c5,v5, o15,h15,l15,c15,v15, o1,h1,l1,c1,v1,
     if sc < CONFIG["SCORE_MIN"]: return None
 
     sl,tp1,tp2,tp3 = r_targets(last,a5,side)
-    sig = {"symbol": pid, "side": side, "entry": round(last,6),
+    out = {"symbol": pid, "side": side, "entry": round(last,6),
            "tp1": round(tp1,6), "tp2": round(tp2,6), "tp3": round(tp3,6), "sl": round(sl,6),
            "atr": round(a5,6), "score": sc}
-    return sig
+    return out
 
 def build_signal(pid):
     if cooldown_active(): return None
-
-    o5,h5,l5,c5,v5 = cb_candles(pid,GRAN_5M,240)
-    if not c5 or illiquid(h5,l5,c5): return None
-    if not hist_profitable(pid,o5,h5,l5,c5,v5): return None
-
-    o15,h15,l15,c15,v15 = cb_candles(pid,GRAN_15M,200)
-    o1,h1,l1,c1,v1      = cb_candles(pid,GRAN_1H,220)
-
-    c4h=None
-    if USE_HTF_FILTER:
-        o4h,h4h,l4h,c4h,v4h = cb_candles(pid,GRAN_4H,220)
-        if not c4h and c1:
-            _o,_h,_l,_c,_v = resample_1h_to_4h(o1,h1,l1,c1,v1)
-            c4h=_c
-
-    # Try long; if shorts enabled, try short; pick the higher score
-    best=None
-    long_sig = _signal_core(pid,"LONG", o5,h5,l5,c5,v5, o15,h15,l15,c15,v15, o1,h1,l1,c1,v1, c4h)
-    if long_sig: best = long_sig
-    if SHORTS_ENABLED:
-        short_sig = _signal_core(pid,"SHORT", o5,h5,l5,c5,v5, o15,h15,l15,c15,v15, o1,h1,l1,c1,v1, c4h)
-        if short_sig and (best is None or short_sig["score"]>best["score"]):
-            best = short_sig
-    return best
+    # try LONG first (trend following bias), then SHORT if allowed
+    sig = build_signal_for_side(pid, "LONG")
+    if sig: return sig
+    if CONFIG.get("ALLOW_SHORTS", ALLOW_SHORTS):
+        return build_signal_for_side(pid, "SHORT")
+    return None
 
 # ---------- Telegram helpers ----------
 def target_chat_id(update: Update=None):
@@ -535,10 +554,10 @@ def target_chat_id(update: Update=None):
     return last_chat_id
 
 def fmt(sig):
-    ladder = f"TP1 {sig['tp1']} | TP2 {sig['tp2']}" + (f" | TP3 {sig['tp3']}" if TP_LEVELS>=3 else "")
-    arrow = "🚀" if sig["side"]=="LONG" else "🧨"
-    side  = "LONG" if sig["side"]=="LONG" else "SHORT"
-    return (f"{arrow} <b>{sig['symbol']}</b> {side} (Intraday • {CONFIG['MODE']})\n"
+    ladder = f"TP1 {sig['tp1']} | TP2 {sig['tp2']}"
+    if TP_LEVELS >= 3: ladder += f" | TP3 {sig['tp3']}"
+    arrow = "LONG" if sig["side"]=="LONG" else "SHORT"
+    return (f"🚀 <b>{sig['symbol']}</b> {arrow} (Intraday • {CONFIG['MODE']})\n"
             f"Entry: <b>{sig['entry']}</b>\n{ladder}\n"
             f"SL: <b>{sig['sl']}</b>\nATR(5m): {sig['atr']} | Score: <b>{sig['score']}</b>/100")
 
@@ -547,7 +566,7 @@ def _parse_split(total_qty):
     try:
         parts=[int(x) for x in TP_SPLIT.split(",") if x!=""]
     except:
-        parts=[50,30,20]
+        parts=[30,30,40]
     if TP_LEVELS < 3: parts = parts[:2] or [60,40]
     s=sum(parts); parts=[max(0,p)/max(1,s) for p in parts]
     if TP_LEVELS >= 3:
@@ -560,7 +579,7 @@ def _parse_split(total_qty):
 def can_open_more(): return len(PAPER["positions"]) < CONFIG["MAX_OPEN_TRADES"]
 def free_usd(): return float(PAPER["cash"])
 
-def exec_trade(sig, ctx: CallbackContext, chat_id):
+def exec_open(sig, ctx: CallbackContext, chat_id):
     if cooldown_active():
         ctx.bot.send_message(chat_id=chat_id, text="⏸ Trading paused (cooldown/day lock)."); return
     if not can_open_more():
@@ -596,8 +615,7 @@ def exec_trade(sig, ctx: CallbackContext, chat_id):
     PAPER["positions"][pos_id] = pos
     save_paper()
     _append_journal({"type":"OPEN","pos":pos})
-    icon = "🟢 BUY" if sig["side"]=="LONG" else "🔻 SELL (short)"
-    ctx.bot.send_message(chat_id=chat_id, text=f"{icon} {sig['symbol']} ${alloc:.2f} | entry {entry} | qty {qty:.6f}")
+    ctx.bot.send_message(chat_id=chat_id, text=f"🟢 PAPER {sig['side']} {sig['symbol']} ${alloc:.2f} | entry {entry} | qty {qty:.6f}")
 
 def _close_block(p, qty, price):
     gross = price * qty
@@ -608,15 +626,17 @@ def _close_block(p, qty, price):
     return fee
 
 def _finalize_close(pid, p, reason, exit_avg):
-    pnl_usd = ((exit_avg - p["entry_avg"]) if p["side"]=="LONG" else (p["entry_avg"] - exit_avg)) * p["qty_total"]
+    pnl_usd = (exit_avg - p["entry_avg"]) * p["qty_total"]
+    if p["side"]=="SHORT":
+        pnl_usd = -pnl_usd  # invert for shorts
     pnl_usd -= (p["fees_open_total"] + p["fees_close_total"])
-    pnl_pct = ((exit_avg - p["entry_avg"]) / p["entry_avg"] * 100 if p["side"]=="LONG"
-               else (p["entry_avg"] - exit_avg) / p["entry_avg"] * 100) if p["entry_avg"] else 0
+    pnl_pct = ((exit_avg - p["entry_avg"]) / p["entry_avg"] * ( -1 if p["side"]=="SHORT" else 1) * 100) if p["entry_avg"] else 0
     PAPER["realized_pnl"] += pnl_usd
     add_result_winloss(pnl_usd)
-    closed = {"id": pid, "symbol": p["symbol"], "side": p["side"], "entry_avg": p["entry_avg"],
+    closed = {"id": pid, "symbol": p["symbol"], "entry_avg": p["entry_avg"],
               "exit_avg": exit_avg, "qty_total": p["qty_total"], "pnl_usd": pnl_usd,
-              "pnl_pct": pnl_pct, "reason": reason, "closed_at": datetime.now(tz).isoformat()}
+              "pnl_pct": pnl_pct, "reason": reason, "side": p["side"],
+              "closed_at": datetime.now(tz).isoformat()}
     PAPER["closed"].append(closed)
     _append_journal({"type":"CLOSE","trade":closed})
     PAPER["positions"].pop(pid, None)
@@ -629,10 +649,9 @@ def paper_check_exits(ctx: CallbackContext):
     for pid, p in list(PAPER["positions"].items()):
         cur = ticker(p["symbol"])
         if not np.isfinite(cur): continue
-        side=p["side"]
 
-        # --- TP3 (gap-safe) ---
-        if TP_LEVELS >= 3 and ((side=="LONG" and cur >= p["tp3"]) or (side=="SHORT" and cur <= p["tp3"])):
+        # TP3 dominates (gap-safe)
+        if TP_LEVELS >= 3 and ((p["side"]=="LONG" and cur >= p["tp3"]) or (p["side"]=="SHORT" and cur <= p["tp3"])):
             rem = p["qty_runner"] + (0 if p["tp2_done"] else p["qty_tp2"]) + (0 if p["tp1_done"] else p["qty_tp1"])
             if rem > 0:
                 _close_block(p, rem, p["tp3"])
@@ -640,41 +659,34 @@ def paper_check_exits(ctx: CallbackContext):
                 tp2_part = (p["tp2"]*p["qty_tp2"]) if p["tp2_done"] else 0.0
                 exit_avg = (tp1_part + tp2_part + p["tp3"]*rem) / p["qty_total"]
                 pnl_usd, pnl_pct = _finalize_close(pid, p, "TP3", exit_avg)
-                tag = "TP3 hit"
-                to_announce.append(f"🎯 <b>{tag}</b> {p['symbol']} avg exit {exit_avg:.6f} | PnL ${pnl_usd:.2f} ({pnl_pct:.2f}%)")
+                to_announce.append(f"🎯 <b>TP3 hit</b> {p['symbol']} ({p['side']}) avg {exit_avg:.6f} | PnL ${pnl_usd:.2f} ({pnl_pct:.2f}%)")
             continue
 
-        # --- TP2 partial ---
-        if (not p["tp2_done"]) and p["qty_tp2"] > 0 and (
-            (side=="LONG" and cur >= p["tp2"]) or (side=="SHORT" and cur <= p["tp2"])
-        ):
+        # TP2 partial
+        if (not p["tp2_done"]) and p["qty_tp2"] > 0 and ((p["side"]=="LONG" and cur >= p["tp2"]) or (p["side"]=="SHORT" and cur <= p["tp2"])):
             _close_block(p, p["qty_tp2"], p["tp2"])
             p["tp2_done"] = True
-            # ratchet SL to TP1 once TP2 achieved
-            p["sl_dyn"] = max(p["sl_dyn"], p["tp1"]) if side=="LONG" else min(p["sl_dyn"], p["tp1"])
-            to_announce.append(f"🥳 <b>TP2</b> {p['symbol']} sold {p['qty_tp2']:.6f} @ {p['tp2']:.6f}")
+            p["sl_dyn"] = max(p["sl_dyn"], p["tp1"]) if p["side"]=="LONG" else min(p["sl_dyn"], p["tp1"])
+            to_announce.append(f"🥳 <b>TP2</b> {p['symbol']} ({p['side']}) sold {p['qty_tp2']:.6f} @ {p['tp2']:.6f}")
 
-        # --- TP1 partial ---
-        if (not p["tp1_done"]) and p["qty_tp1"] > 0 and (
-            (side=="LONG" and cur >= p["tp1"]) or (side=="SHORT" and cur <= p["tp1"])
-        ):
+        # TP1 partial
+        if (not p["tp1_done"]) and p["qty_tp1"] > 0 and ((p["side"]=="LONG" and cur >= p["tp1"]) or (p["side"]=="SHORT" and cur <= p["tp1"])):
             _close_block(p, p["qty_tp1"], p["tp1"])
             p["tp1_done"] = True
-            # ratchet SL to BE after TP1
             if TRAIL_AFTER_TP1:
-                p["sl_dyn"] = max(p["sl_dyn"], p["entry_avg"]) if side=="LONG" else min(p["sl_dyn"], p["entry_avg"])
-            to_announce.append(f"✅ <b>TP1</b> {p['symbol']} sold {p['qty_tp1']:.6f} @ {p['tp1']:.6f}")
+                p["sl_dyn"] = max(p["sl_dyn"], p["entry_avg"]) if p["side"]=="LONG" else min(p["sl_dyn"], p["entry_avg"])
+            to_announce.append(f"✅ <b>TP1</b> {p['symbol']} ({p['side']}) sold {p['qty_tp1']:.6f} @ {p['tp1']:.6f}")
 
-        # --- SL on runner ---
+        # stop-loss on runner
         rem_runner = p["qty_runner"]
-        sl_hit = (side=="LONG" and cur <= p["sl_dyn"]) or (side=="SHORT" and cur >= p["sl_dyn"])
+        sl_hit = (p["side"]=="LONG" and cur <= p["sl_dyn"]) or (p["side"]=="SHORT" and cur >= p["sl_dyn"])
         if sl_hit and rem_runner > 0:
             _close_block(p, rem_runner, p["sl_dyn"])
             tp1_part = (p["tp1"] * p["qty_tp1"]) if p["tp1_done"] else 0.0
             tp2_part = (p["tp2"] * p["qty_tp2"]) if p["tp2_done"] else 0.0
             exit_avg = (tp1_part + tp2_part + p["sl_dyn"]*rem_runner) / p["qty_total"]
             pnl_usd, pnl_pct = _finalize_close(pid, p, "SL", exit_avg)
-            to_announce.append(f"🛑 <b>SL</b> {p['symbol']} avg exit {exit_avg:.6f} | PnL ${pnl_usd:.2f} ({pnl_pct:.2f}%)")
+            to_announce.append(f"🛑 <b>SL</b> {p['symbol']} ({p['side']}) avg {exit_avg:.6f} | PnL ${pnl_usd:.2f} ({pnl_pct:.2f}%)")
 
     for msg in to_announce:
         chat_id = target_chat_id()
@@ -687,7 +699,7 @@ def update_equity_mark():
         cur = ticker(p["symbol"])
         if np.isfinite(cur):
             rem = (0 if p["tp1_done"] else p["qty_tp1"]) + (0 if p["tp2_done"] else p["qty_tp2"]) + p["qty_runner"]
-            # mark-to-market PnL approximation (same for long/short because we value by current price)
+            # same mark for both sides (we mark to market using current price)
             eq += cur * rem * (1 - FEE_RATE)
     PAPER["equity"] = eq
     save_paper()
@@ -696,7 +708,8 @@ def update_equity_mark():
 def ensure_universe():
     global watchlist
     if not watchlist:
-        base = get_pairs_top(limit=max(60, MAX_PAIRS))
+        base = get_pairs_top(limit=max(60, CONFIG.get("MAX_PAIRS", MAX_PAIRS)))
+        # 1h momentum priority
         mom=[]
         for pid in base[:80]:
             o1,h1,l1,c1,v1=cb_candles(pid,GRAN_1H,30)
@@ -708,7 +721,7 @@ def ensure_universe():
         for _,pid in mom + [(0,p) for p in base]:
             if pid not in seen:
                 merged.append(pid); seen.add(pid)
-            if len(merged)>=MAX_PAIRS: break
+            if len(merged)>=CONFIG.get("MAX_PAIRS", MAX_PAIRS): break
         watchlist = merged or base
         logging.info(f"Watchlist prepared: {len(watchlist)} symbols")
     return watchlist
@@ -748,7 +761,7 @@ def scan_chunk(ctx: CallbackContext, push_to=None):
             signals.append({"time": now, **sig})
             if chat_id:
                 ctx.bot.send_message(chat_id=chat_id, text=fmt(sig), parse_mode=ParseMode.HTML)
-            exec_trade(sig, ctx, chat_id)
+            exec_open(sig, ctx, chat_id)
             hits += 1
             time.sleep(0.08)
 
@@ -759,7 +772,7 @@ def scan_chunk(ctx: CallbackContext, push_to=None):
         SCAN_LOCK.release()
 
 def watchdog_scan(ctx: CallbackContext):
-    if time.time() - LAST_SCAN_TS > 3*SCAN_INTERVAL_SECONDS:
+    if time.time() - LAST_SCAN_TS > 3*CONFIG.get("SCAN_INTERVAL_SECONDS", SCAN_INTERVAL_SECONDS):
         logging.warning("Scan watchdog: poking scan_chunk")
         scan_chunk(ctx)
 
@@ -767,6 +780,7 @@ def watchdog_scan(ctx: CallbackContext):
 def job_scan(ctx: CallbackContext): scan_chunk(ctx)
 def job_paper(ctx: CallbackContext):
     paper_check_exits(ctx); update_equity_mark()
+
 def job_daily(ctx: CallbackContext):
     global START_OF_DAY, EQUITY_OPEN
     chat_id = target_chat_id()
@@ -784,53 +798,75 @@ def job_daily(ctx: CallbackContext):
                for s in recent))
     ctx.bot.send_message(chat_id=chat_id, text=msg, parse_mode=ParseMode.HTML)
 
+# ---------- dashboard ----------
+def _exposure_and_counts():
+    long_cnt = short_cnt = 0
+    exp_long = exp_short = 0.0
+    for p in PAPER["positions"].values():
+        cur = ticker(p["symbol"])
+        if not np.isfinite(cur): cur = p["entry_avg"]
+        rem = (0 if p["tp1_done"] else p["qty_tp1"]) + (0 if p["tp2_done"] else p["qty_tp2"]) + p["qty_runner"]
+        if p["side"]=="LONG":
+            long_cnt += 1
+            exp_long += cur * rem
+        else:
+            short_cnt += 1
+            exp_short += cur * rem
+    return long_cnt, short_cnt, exp_long, exp_short
+
+def _last_closed_lines(n=5):
+    lines=[]
+    for t in PAPER["closed"][-n:]:
+        lines.append(f"• {t['symbol']} {t.get('side','?')} {t['pnl_pct']:.2f}% [{t['reason']}]")
+    return lines or ["• none"]
+
+def cmd_dashboard(update: Update, ctx: CallbackContext):
+    long_cnt, short_cnt, exp_long, exp_short = _exposure_and_counts()
+    wr = (PAPER["wins"]/(PAPER["wins"]+PAPER["losses"])*100) if (PAPER["wins"]+PAPER["losses"]) else 0.0
+    cool = "YES" if cooldown_active() else "NO"
+    lock = "YES" if time.time() < DAY_LOCK_UNTIL else "NO"
+    msg = (
+        "<b>📋 Dashboard</b>\n"
+        f"Eq: ${PAPER['equity']:.2f} | Cash: ${PAPER['cash']:.2f}\n"
+        f"Realized: ${PAPER['realized_pnl']:.2f} | Fees: ${PAPER['fees_paid']:.2f} | WR: {wr:.1f}%\n"
+        f"Open: {len(PAPER['positions'])} (LONG {long_cnt} | SHORT {short_cnt})\n"
+        f"Exposure ≈ LONG ${exp_long:.0f} | SHORT ${exp_short:.0f}\n"
+        f"Universe: {len(ensure_universe())} | Chunk {CHUNK_SIZE} | Scan {CONFIG.get('SCAN_INTERVAL_SECONDS', SCAN_INTERVAL_SECONDS)}s\n"
+        f"Mode: {CONFIG['MODE']} | SCORE≥{CONFIG['SCORE_MIN']} | Shorts: {('ON' if CONFIG.get('ALLOW_SHORTS',ALLOW_SHORTS) else 'OFF')}\n"
+        f"Cooldown: {cool} | DayLock: {lock}\n"
+        "Last closes:\n" + "\n".join(_last_closed_lines(5))
+    )
+    ctx.bot.send_message(chat_id=target_chat_id(update), text=msg, parse_mode=ParseMode.HTML)
+
+def cmd_help(update: Update, ctx: CallbackContext):
+    ctx.bot.send_message(chat_id=target_chat_id(update), parse_mode=ParseMode.HTML, text=(
+        "<b>Commands</b>\n"
+        "/dashboard — overview\n"
+        "/paper /positions /closed /pnl — account & trades\n"
+        "/scan — run a scan pass now\n"
+        "/setmode RELAXED|STRICT — rule set\n"
+        "/setscore N — score floor\n"
+        "/setflags EDGE|CORR|REGIME|COOLDOWN|SESSION 0|1 — modules\n"
+        "/setmaxpairs N — change universe size (e.g. 100)\n"
+        "/setscan S — scan interval seconds (e.g. 30)\n"
+        "/setchunks N — symbols per scan chunk (12..30)\n"
+        "/setshorts 0|1 — enable/disable short signals\n"
+        "/status /ping"
+    ))
+
 # ---------- commands ----------
 def cmd_start(update: Update, ctx: CallbackContext):
     qf = int(os.getenv("SESSION_QUIET_FROM","2")); qt=int(os.getenv("SESSION_QUIET_TO","5"))
-    shorts_text = "ON (paper)" if SHORTS_ENABLED else "OFF"
     ctx.bot.send_message(chat_id=target_chat_id(update), parse_mode=ParseMode.HTML, text=(
         "👋 InsiderSignals_Manual\n"
         f"Mode: <b>{CONFIG['MODE']}</b> | SCORE_MIN <b>{CONFIG['SCORE_MIN']}</b>\n"
         f"Max open: <b>{CONFIG['MAX_OPEN_TRADES']}</b> | Alloc: <b>{int(CONFIG['POSITION_PCT']*100)}%</b>\n"
-        f"TPs: <b>{TP_LEVELS}</b> levels | Split <b>{TP_SPLIT}</b> | Ratchet SL (BE→TP1→TP2)\n"
-        f"Shorts: <b>{shorts_text}</b>\n"
+        f"TPs: <b>{TP_LEVELS}</b> | Split <b>{TP_SPLIT}</b> | Ratchet SL (BE→TP1→TP2)\n"
+        f"Shorts: <b>{'ON' if CONFIG.get('ALLOW_SHORTS',ALLOW_SHORTS) else 'OFF'}</b>\n"
         f"Flags: EDGE={FLAGS['EDGE']} CORR={FLAGS['CORR']} REGIME={FLAGS['REGIME']} COOLDOWN={FLAGS['COOLDOWN']} SESSION={FLAGS['SESSION']} (quiet {qf}-{qt}h)\n"
-        f"Paper cash: ${PAPER['cash']:.2f}\n\n"
-        "Commands:\n"
-        "/scan /paper /positions /closed /pnl /lasttrades\n"
-        "/setscore S /setmode RELAXED|STRICT /setflags EDGE|CORR|REGIME|COOLDOWN|SESSION 0|1\n"
-        "/status /ping"
+        f"Paper cash: ${PAPER['cash']:.2f}\n"
+        "Use /dashboard and /help to see more."
     ))
-
-def _format_pos_line(p, cur):
-    if not np.isfinite(cur): cur = p["entry_avg"]
-    up_span = (p["tp3"] if TP_LEVELS>=3 else p["tp2"]) - p["entry_avg"] if p["side"]=="LONG" else p["entry_avg"] - (p["tp3"] if TP_LEVELS>=3 else p["tp2"])
-    dn_span = p["entry_avg"] - p["sl_dyn"] if p["side"]=="LONG" else p["sl_dyn"] - p["entry_avg"]
-    if up_span <= 0: prog = 0.0
-    elif (p["side"]=="LONG" and cur >= p["entry_avg"]) or (p["side"]=="SHORT" and cur <= p["entry_avg"]):
-        prog = min(100.0, (abs(cur - p["entry_avg"]) / max(1e-9, abs(up_span))) * 100)
-    else:
-        prog = -min(100.0, (abs(p["entry_avg"] - cur) / max(1e-9, abs(dn_span))) * 100)
-    pnl_usd = ((cur - p["entry_avg"]) if p["side"]=="LONG" else (p["entry_avg"] - cur)) * p["qty_total"] - p["fees_open_total"]
-    pnl_pct = ((cur - p["entry_avg"]) / p["entry_avg"] * 100 if p["side"]=="LONG"
-               else (p["entry_avg"] - cur) / p["entry_avg"] * 100) if p["entry_avg"] else 0
-    return f"• {p['symbol']} qty {p['qty_total']:.6f} | entry {p['entry_avg']:.6f} | now {cur:.6f} | PnL ${pnl_usd:.2f} ({pnl_pct:.2f}%) | progress {prog:.1f}%"
-
-def cmd_positions(update: Update, ctx: CallbackContext):
-    if not PAPER["positions"]:
-        ctx.bot.send_message(chat_id=target_chat_id(update), text="No open paper positions."); return
-    longs=[]; shorts=[]
-    for pid, p in PAPER["positions"].items():
-        cur = ticker(p["symbol"])
-        (longs if p["side"]=="LONG" else shorts).append(_format_pos_line(p, cur))
-    lines=[]
-    if longs:
-        lines.append("📈 <b>Long Positions</b>")
-        lines += longs
-    if shorts:
-        lines.append("\n📉 <b>Short Positions</b>")
-        lines += shorts
-    ctx.bot.send_message(chat_id=target_chat_id(update), text="\n".join(lines), parse_mode=ParseMode.HTML)
 
 def cmd_paper(update: Update, ctx: CallbackContext):
     update_equity_mark()
@@ -847,14 +883,38 @@ def cmd_pnl(update: Update, ctx: CallbackContext):
         text=(f"📈 <b>PnL</b>\nRealized: ${PAPER['realized_pnl']:.2f}\n"
               f"Fees: ${PAPER['fees_paid']:.2f}\nWins: {wins} | Losses: {losses} | Win rate: {wr:.1f}%"))
 
+def cmd_positions(update: Update, ctx: CallbackContext):
+    if not PAPER["positions"]:
+        ctx.bot.send_message(chat_id=target_chat_id(update), text="No open paper positions."); return
+    lines = ["📊 <b>Open Positions</b>"]
+    for pid, p in PAPER["positions"].items():
+        cur = ticker(p["symbol"])
+        if not np.isfinite(cur): cur = p["entry_avg"]
+        up_span = ((p["tp3"] if TP_LEVELS>=3 else p["tp2"]) - p["entry_avg"]) if p["side"]=="LONG" else (p["entry_avg"] - (p["tp3"] if TP_LEVELS>=3 else p["tp2"]))
+        dn_span = (p["entry_avg"] - p["sl_dyn"]) if p["side"]=="LONG" else (p["sl_dyn"] - p["entry_avg"])
+        if up_span <= 0: prog = 0.0
+        elif (p["side"]=="LONG" and cur >= p["entry_avg"]) or (p["side"]=="SHORT" and cur <= p["entry_avg"]):
+            prog = min(100.0, abs(cur - p["entry_avg"]) / max(1e-9, up_span) * 100)
+        else:
+            prog = -min(100.0, abs(p["entry_avg"] - cur) / max(1e-9, dn_span) * 100)
+        # approximate PnL sign-aware
+        pnl_usd = ((cur - p["entry_avg"]) * p["qty_total"])
+        if p["side"]=="SHORT": pnl_usd = -pnl_usd
+        pnl_usd -= p["fees_open_total"]
+        pnl_pct = ((cur - p["entry_avg"]) / p["entry_avg"] * ( -1 if p["side"]=="SHORT" else 1) * 100) if p["entry_avg"] else 0
+        lines.append(
+            f"• {p['symbol']} {p['side']} qty {p['qty_total']:.6f} | entry {p['entry_avg']:.6f} | now {cur:.6f} | "
+            f"PnL ${pnl_usd:.2f} ({pnl_pct:.2f}%) | progress {prog:.1f}%"
+        )
+    ctx.bot.send_message(chat_id=target_chat_id(update), text="\n".join(lines), parse_mode=ParseMode.HTML)
+
 def cmd_closed(update: Update, ctx: CallbackContext):
     if not PAPER["closed"]:
         ctx.bot.send_message(chat_id=target_chat_id(update), text="No closed paper trades yet."); return
     lines = ["✅ <b>Closed Trades (last 10)</b>"]
     for t in PAPER["closed"][-10:]:
-        ladd = f" [{t['reason']}]"
-        lines.append(f"• {t['symbol']} {t['side']} @ {t['entry_avg']:.6f} → {t['exit_avg']:.6f} | "
-                     f"Qty {t['qty_total']:.6f} | PnL ${t['pnl_usd']:.2f} ({t['pnl_pct']:.2f}%)" + ladd)
+        lines.append(f"• {t['symbol']} {t.get('side','?')} @ {t['entry_avg']:.6f} → {t['exit_avg']:.6f} | "
+                     f"Qty {t['qty_total']:.6f} | PnL ${t['pnl_usd']:.2f} ({t['pnl_pct']:.2f}%) [{t['reason']}]")
     ctx.bot.send_message(chat_id=target_chat_id(update), text="\n".join(lines), parse_mode=ParseMode.HTML)
 
 def cmd_lasttrades(update: Update, ctx: CallbackContext):
@@ -866,9 +926,9 @@ def cmd_lasttrades(update: Update, ctx: CallbackContext):
             for row in f.readlines()[-12:]:
                 j=json.loads(row)
                 if j.get("type")=="OPEN":
-                    p=j["pos"]; lines.append(f"• OPEN {p['symbol']} {p['side']} qty {p['qty_total']:.6f} @ {p['entry_avg']}")
+                    p=j["pos"]; lines.append(f"• OPEN {p['symbol']} {p['side']} {p['qty_total']:.6f} @ {p['entry_avg']}")
                 elif j.get("type")=="CLOSE":
-                    t=j["trade"]; lines.append(f"• CLOSE {t['symbol']} {t['side']} pnl ${t['pnl_usd']:.2f} ({t['pnl_pct']:.2f}%) [{t['reason']}]")
+                    t=j["trade"]; lines.append(f"• CLOSE {t['symbol']} {t.get('side','?')} ${t['pnl_usd']:.2f} ({t['pnl_pct']:.2f}%) [{t['reason']}]")
         if not lines: lines=["No trades yet."]
         ctx.bot.send_message(chat_id=target_chat_id(update), text="\n".join(lines))
     except Exception as e:
@@ -899,6 +959,39 @@ def cmd_setflags(update: Update, ctx: CallbackContext):
     except Exception:
         ctx.bot.send_message(chat_id=target_chat_id(update), text="Usage: /setflags EDGE|CORR|REGIME|COOLDOWN|SESSION 0|1")
 
+def cmd_setmaxpairs(update: Update, ctx: CallbackContext):
+    try:
+        n = int(update.message.text.split()[1]); assert 20 <= n <= 200
+        CONFIG["MAX_PAIRS"] = n; save_config()
+        global watchlist; watchlist=[]  # rebuild with new size
+        ctx.bot.send_message(chat_id=target_chat_id(update), text=f"✅ MAX_PAIRS set to {n}. Universe will refresh.")
+    except Exception:
+        ctx.bot.send_message(chat_id=target_chat_id(update), text="Usage: /setmaxpairs 20..200")
+
+def cmd_setscan(update: Update, ctx: CallbackContext):
+    try:
+        s = int(update.message.text.split()[1]); assert 10 <= s <= 120
+        CONFIG["SCAN_INTERVAL_SECONDS"] = s; save_config()
+        ctx.bot.send_message(chat_id=target_chat_id(update), text=f"✅ Scan interval set to {s}s. (Takes effect on next scheduler tick.)")
+    except Exception:
+        ctx.bot.send_message(chat_id=target_chat_id(update), text="Usage: /setscan 10..120")
+
+def cmd_setchunks(update: Update, ctx: CallbackContext):
+    try:
+        n = int(update.message.text.split()[1]); assert 8 <= n <= 40
+        global CHUNK_SIZE; CHUNK_SIZE = n
+        ctx.bot.send_message(chat_id=target_chat_id(update), text=f"✅ Chunk size set to {n}.")
+    except Exception:
+        ctx.bot.send_message(chat_id=target_chat_id(update), text="Usage: /setchunks 8..40")
+
+def cmd_setshorts(update: Update, ctx: CallbackContext):
+    try:
+        v = int(update.message.text.split()[1]); assert v in (0,1)
+        CONFIG["ALLOW_SHORTS"] = v; save_config()
+        ctx.bot.send_message(chat_id=target_chat_id(update), text=f"✅ Shorts {'ENABLED' if v else 'DISABLED'}.")
+    except Exception:
+        ctx.bot.send_message(chat_id=target_chat_id(update), text="Usage: /setshorts 0|1")
+
 def cmd_scan(update: Update, ctx: CallbackContext):
     ctx.bot.send_message(chat_id=target_chat_id(update), text=f"🔍 Scan running (mode={CONFIG['MODE']}, score≥{CONFIG['SCORE_MIN']})…")
     scan_chunk(ctx, push_to=target_chat_id(update))
@@ -907,7 +1000,7 @@ def cmd_status(update: Update, ctx: CallbackContext):
     ctx.bot.send_message(chat_id=target_chat_id(update),
         text=(f"OK | MODE={CONFIG['MODE']} SCORE≥{CONFIG['SCORE_MIN']} | chunk={CHUNK_SIZE} "
               f"| open={len(PAPER['positions'])} | cash=${PAPER['cash']:.2f} eq=${PAPER['equity']:.2f} "
-              f"| shorts={'ON' if SHORTS_ENABLED else 'OFF'} | cooldown={'YES' if cooldown_active() else 'NO'}"))
+              f"| cooldown={'YES' if cooldown_active() else 'NO'} | shorts={'ON' if CONFIG.get('ALLOW_SHORTS',ALLOW_SHORTS) else 'OFF'}"))
 
 def cmd_ping(update: Update, ctx: CallbackContext):
     ctx.bot.send_message(chat_id=target_chat_id(update), text="pong")
@@ -919,6 +1012,8 @@ def main():
 
     dp = updater.dispatcher
     dp.add_handler(CommandHandler("start", cmd_start))
+    dp.add_handler(CommandHandler("help", cmd_help))
+    dp.add_handler(CommandHandler("dashboard", cmd_dashboard))
     dp.add_handler(CommandHandler("paper", cmd_paper))
     dp.add_handler(CommandHandler("pnl", cmd_pnl))
     dp.add_handler(CommandHandler("positions", cmd_positions))
@@ -927,17 +1022,21 @@ def main():
     dp.add_handler(CommandHandler("setscore", cmd_setscore))
     dp.add_handler(CommandHandler("setmode", cmd_setmode))
     dp.add_handler(CommandHandler("setflags", cmd_setflags))
+    dp.add_handler(CommandHandler("setmaxpairs", cmd_setmaxpairs))
+    dp.add_handler(CommandHandler("setscan", cmd_setscan))
+    dp.add_handler(CommandHandler("setchunks", cmd_setchunks))
+    dp.add_handler(CommandHandler("setshorts", cmd_setshorts))
     dp.add_handler(CommandHandler("scan", cmd_scan))
     dp.add_handler(CommandHandler("status", cmd_status))
     dp.add_handler(CommandHandler("ping", cmd_ping))
 
     jq: JobQueue = updater.job_queue
-    jq.run_repeating(job_scan, interval=SCAN_INTERVAL_SECONDS, first=random.randint(6,12), name="job_scan")
+    jq.run_repeating(job_scan, interval=CONFIG.get("SCAN_INTERVAL_SECONDS", SCAN_INTERVAL_SECONDS), first=random.randint(6,12), name="job_scan")
     jq.run_repeating(job_paper, interval=PAPER_CHECK_SECONDS, first=8, name="job_paper")
-    jq.run_repeating(watchdog_scan, interval=max(20, SCAN_INTERVAL_SECONDS), first=20, name="watchdog")
+    jq.run_repeating(watchdog_scan, interval=max(20, CONFIG.get("SCAN_INTERVAL_SECONDS", SCAN_INTERVAL_SECONDS)), first=20, name="watchdog")
     jq.run_daily(job_daily, time=dtime(hour=DAILY_REPORT_HOUR, minute=0, tzinfo=tz))
 
-    logging.info("Manual bot v3.6.1 started")
+    logging.info("Manual bot v3.7 started")
     updater.start_polling()
     updater.idle()
 
