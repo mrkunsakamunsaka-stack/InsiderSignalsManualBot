@@ -9,6 +9,4 @@ __pycache__/
 .DS_Store
 *.log
 paper.json
-config.json
 journal.jsonl
-
