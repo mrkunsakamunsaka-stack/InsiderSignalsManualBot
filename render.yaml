@@ -1,5 +1,5 @@
 services:
-  - type: worker                 # background worker (no HTTP port required)
+  - type: worker
     name: InsiderSignalsManual
     env: docker
     plan: starter
@@ -7,21 +7,18 @@ services:
     dockerfilePath: ./Dockerfile
 
     envVars:
-      # --- Required secret (set in Render > Environment) ---
       - key: TELEGRAM_MANUAL_TOKEN
-        value: ""                # fill in via Dashboard before starting
+        value: ""          # set in Render dashboard
 
-      # --- Optional: lock bot to one chat (numeric Telegram chat id) ---
       - key: CHAT_ID
-        value: ""
+        value: ""          # (optional) numeric Telegram chat id
 
-      # --- Timezone & daily report hour ---
       - key: TIMEZONE
         value: Europe/Dublin
       - key: DAILY_REPORT_HOUR
         value: "20"
 
-      # --- Scan cadence & universe size ---
+      # Scan cadence & universe size
       - key: SCAN_INTERVAL_SECONDS
         value: "30"
       - key: SYMBOLS_PER_SCAN
@@ -29,15 +26,15 @@ services:
       - key: SIGNAL_COOLDOWN_MINUTES
         value: "8"
       - key: MAX_PAIRS
-        value: "60"      # raise to 100 later if desired
+        value: "60"
 
-      # --- Mode & score floor ---
+      # Mode & score floor
       - key: MODE
         value: STRICT
       - key: SCORE_MIN
         value: "97"
 
-      # --- Exits & trailing (R multiples) ---
+      # Exits & trailing (3 TP ladder)
       - key: R_TP1
         value: "1.0"
       - key: R_TP2
@@ -46,30 +43,14 @@ services:
         value: "3.0"
       - key: R_SL
         value: "1.1"
+      - key: TP_SPLIT
+        value: "50,30,20"
+      - key: TP_LEVELS
+        value: "3"
       - key: FEE_RATE
         value: "0.001"
 
-      # --- TP ladder config ---
-      - key: TP_SPLIT
-        value: "30,30,40"
-      - key: TP_LEVELS
-        value: "3"
-
-      # --- Short trading (paper-only switch) ---
-      - key: ENABLE_SHORTS
-        value: "0"       # set "1" to enable paper SHORT signals
-
-      # --- SL glitch guard (Update 1) ---
-      - key: SL_BAND_PCT
-        value: "0.0002"  # 0.02%
-      - key: POST_TP_HOLD_MS
-        value: "1500"
-      - key: MAX_STOP_PCT
-        value: "0.20"    # cap SL distance vs entry (20%)
-      - key: MAX_GAP_PCT
-        value: "0.08"    # log large gaps (8%)
-
-      # --- Paper sizing ---
+      # Paper sizing
       - key: POSITION_PCT
         value: "0.05"
       - key: MAX_OPEN_TRADES
@@ -79,9 +60,9 @@ services:
       - key: PAPER_START_CASH
         value: "300"
       - key: PAPER_CHECK_SECONDS
-        value: "5"       # faster SL/TP checks
+        value: "15"
 
-      # --- Feature flags (1=on, 0=off) ---
+      # Features
       - key: EDGE
         value: "1"
       - key: CORR
@@ -93,7 +74,11 @@ services:
       - key: SESSION
         value: "1"
 
-      # --- Historical quick validator ---
+      # SHORTS toggle (0=OFF, 1=ON)
+      - key: SHORTS_ENABLED
+        value: "1"
+
+      # Historical validator
       - key: HIST_LOOKBACK_BARS_5M
         value: "900"
       - key: HIST_MIN_OCCURRENCES
@@ -101,13 +86,13 @@ services:
       - key: HIST_MIN_SUCCESS
         value: "0.55"
 
-      # --- Correlation thresholds ---
+      # Correlation thresholds
       - key: CORR_BLOCK
         value: "0.8"
       - key: CORR_HALF
         value: "0.6"
 
-      # --- Streak/day guard ---
+      # Streak/day guard
       - key: COOLDOWN_LOSSES
         value: "3"
       - key: COOLDOWN_WINDOW_MIN
@@ -119,7 +104,7 @@ services:
       - key: DAY_LOCK_MIN
         value: "180"
 
-      # --- Request hygiene ---
+      # Request hygiene
       - key: RETRY_MAX
         value: "4"
       - key: RETRY_BASE_DELAY
@@ -129,7 +114,7 @@ services:
       - key: REQ_JITTER_MAX_MS
         value: "140"
 
-      # --- Quiet session window (local TZ) ---
+      # Quiet session window (local TZ)
       - key: SESSION_QUIET_FROM
         value: "2"
       - key: SESSION_QUIET_TO
