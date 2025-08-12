@@ -7,21 +7,21 @@ services:
     dockerfilePath: ./Dockerfile
 
     envVars:
-      # --- Required secret ---
+      # Required secret (set in Render dashboard)
       - key: TELEGRAM_MANUAL_TOKEN
-        value: ""              # set in Render dashboard
+        value: ""     # fill in the dashboard
 
-      # --- Optional: lock to one chat (numeric) ---
+      # Optional: lock bot to a single chat
       - key: CHAT_ID
-        value: ""              # leave blank to bind on first /start
+        value: ""     # numeric chat id or leave empty
 
-      # --- Timezone & daily report hour ---
+      # Timezone & daily report
       - key: TIMEZONE
         value: Europe/Dublin
       - key: DAILY_REPORT_HOUR
         value: "20"
 
-      # --- Scan cadence & universe ---
+      # Scan cadence & universe size
       - key: SCAN_INTERVAL_SECONDS
         value: "30"
       - key: SYMBOLS_PER_SCAN
@@ -29,15 +29,15 @@ services:
       - key: SIGNAL_COOLDOWN_MINUTES
         value: "8"
       - key: MAX_PAIRS
-        value: "60"            # set 100 if you want top 100
+        value: "60"   # change to 100 if you want top-100 by default
 
-      # --- Mode & score floor ---
+      # Mode & score floor
       - key: MODE
         value: STRICT
       - key: SCORE_MIN
         value: "97"
 
-      # --- Exits & TP ladder (3 levels) ---
+      # Exits & trailing (3-TP ladder, SL in R)
       - key: R_TP1
         value: "1.0"
       - key: R_TP2
@@ -47,13 +47,13 @@ services:
       - key: R_SL
         value: "1.1"
       - key: TP_SPLIT
-        value: "30,30,40"      # TP1/TP2/Runner split
+        value: "50,30,20"
       - key: TP_LEVELS
         value: "3"
       - key: FEE_RATE
         value: "0.001"
 
-      # --- Paper sizing ---
+      # Paper sizing
       - key: POSITION_PCT
         value: "0.05"
       - key: MAX_OPEN_TRADES
@@ -63,9 +63,9 @@ services:
       - key: PAPER_START_CASH
         value: "300"
       - key: PAPER_CHECK_SECONDS
-        value: "5"             # fast exit checks
+        value: "5"    # faster exit checks
 
-      # --- Feature flags (1=on, 0=off) ---
+      # Feature flags
       - key: EDGE
         value: "1"
       - key: CORR
@@ -77,7 +77,13 @@ services:
       - key: SESSION
         value: "1"
 
-      # --- Historical quick validator ---
+      # NEW: trade-direction toggles (defaults: LONGS on, SHORTS off)
+      - key: LONGS
+        value: "1"
+      - key: SHORTS
+        value: "0"    # set to "1" if you want shorts on at boot
+
+      # Historical validator
       - key: HIST_LOOKBACK_BARS_5M
         value: "900"
       - key: HIST_MIN_OCCURRENCES
@@ -85,13 +91,13 @@ services:
       - key: HIST_MIN_SUCCESS
         value: "0.55"
 
-      # --- Correlation thresholds ---
+      # Correlation thresholds
       - key: CORR_BLOCK
         value: "0.8"
       - key: CORR_HALF
         value: "0.6"
 
-      # --- Streak/day guard ---
+      # Streak/day guard
       - key: COOLDOWN_LOSSES
         value: "3"
       - key: COOLDOWN_WINDOW_MIN
@@ -103,7 +109,7 @@ services:
       - key: DAY_LOCK_MIN
         value: "180"
 
-      # --- Request hygiene ---
+      # Request hygiene
       - key: RETRY_MAX
         value: "4"
       - key: RETRY_BASE_DELAY
@@ -113,12 +119,8 @@ services:
       - key: REQ_JITTER_MAX_MS
         value: "140"
 
-      # --- Quiet session window (local TZ) ---
+      # Quiet session window (local TZ)
       - key: SESSION_QUIET_FROM
         value: "2"
       - key: SESSION_QUIET_TO
         value: "5"
-
-      # --- Optional: default for shorts (can toggle at runtime with /setshorts) ---
-      - key: ALLOW_SHORTS
-        value: "0"
