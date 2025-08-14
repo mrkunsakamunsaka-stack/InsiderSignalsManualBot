@@ -1,19 +1,14 @@
 services:
   - type: worker
-    name: InsiderSignalsManual
-    env: docker
+    name: insider-manual-bot-v41
+    env: python
+    buildCommand: ""
+    startCommand: "python manual_bot.py"
     plan: starter
     autoDeploy: true
-    dockerfilePath: ./Dockerfile
-
     envVars:
       - key: TELEGRAM_MANUAL_TOKEN
-        value: ""          # fill in Render dashboard (secret)
-
-      - key: CHAT_ID
-        value: ""          # optional lock
-
-      # Timezone & daily report
+        sync: false           # put your bot token value in the dashboard/Env tab
       - key: TIMEZONE
         value: Europe/Dublin
       - key: DAILY_REPORT_HOUR
@@ -24,18 +19,18 @@ services:
         value: "30"
       - key: SYMBOLS_PER_SCAN
         value: "20"
-      - key: SIGNAL_COOLDOWN_MINUTES
-        value: "8"
       - key: MAX_PAIRS
         value: "60"
+      - key: SIGNAL_COOLDOWN_MINUTES
+        value: "8"
 
-      # Mode & score floor
-      - key: MODE
-        value: STRICT
+      # Scoring / modes
       - key: SCORE_MIN
         value: "97"
+      - key: MODE
+        value: "STRICT"
 
-      # Exits & trailing
+      # Exits & ladder (R = ATR(5m))
       - key: R_TP1
         value: "1.0"
       - key: R_TP2
@@ -44,12 +39,14 @@ services:
         value: "3.0"
       - key: R_SL
         value: "1.1"
-      - key: FEE_RATE
-        value: "0.001"
       - key: TP_SPLIT
         value: "40,30,30"
       - key: TP_LEVELS
         value: "3"
+      - key: FEE_RATE
+        value: "0.001"
+
+      # SL glitch protection
       - key: SL_DEBOUNCE_SEC
         value: "0.35"
       - key: SL_BAND_PCT
@@ -61,7 +58,7 @@ services:
       - key: MAX_GAP_PCT
         value: "8.0"
 
-      # Paper sizing
+      # Paper sizing (can change at runtime via commands)
       - key: POSITION_PCT
         value: "0.05"
       - key: MAX_OPEN_TRADES
@@ -73,7 +70,7 @@ services:
       - key: PAPER_CHECK_SECONDS
         value: "5"
 
-      # Feature flags
+      # Feature flags (1/0)
       - key: EDGE
         value: "1"
       - key: CORR
@@ -85,56 +82,26 @@ services:
       - key: SESSION
         value: "1"
 
-      # Sides & filters
+      # Side toggles (can also flip by commands)
       - key: LONGS
         value: "1"
       - key: SHORTS
         value: "0"
+
+      # Correlation & candles (togglable via commands)
       - key: CORR_ENABLED
         value: "1"
       - key: CANDLE_FILTER
         value: "0"
 
-      # Historical validator
-      - key: HIST_LOOKBACK_BARS_5M
-        value: "900"
-      - key: HIST_MIN_OCCURRENCES
-        value: "10"
-      - key: HIST_MIN_SUCCESS
-        value: "0.55"
-
-      # Correlation thresholds
-      - key: CORR_BLOCK
-        value: "0.8"
-      - key: CORR_HALF
-        value: "0.6"
-
-      # Streak guard
-      - key: COOLDOWN_LOSSES
-        value: "3"
-      - key: COOLDOWN_WINDOW_MIN
-        value: "120"
-      - key: COOLDOWN_PAUSE_MIN
-        value: "60"
-
-      # HTTP hygiene
-      - key: RETRY_MAX
-        value: "4"
-      - key: RETRY_BASE_DELAY
-        value: "0.6"
-      - key: REQ_JITTER_MIN_MS
-        value: "50"
-      - key: REQ_JITTER_MAX_MS
-        value: "140"
-
-      # Quiet session window
-      - key: SESSION_QUIET_FROM
-        value: "2"
-      - key: SESSION_QUIET_TO
-        value: "5"
-
-      # Auto-Tune (OFF by default)
+      # Auto-Tune (OFF by default; turn on with /autotune 1)
       - key: AUTO_TUNE
         value: "0"
       - key: TUNE_INTERVAL_MIN
         value: "10"
+
+      # Quiet session window (02–05 local time)
+      - key: SESSION_QUIET_FROM
+        value: "2"
+      - key: SESSION_QUIET_TO
+        value: "5"
